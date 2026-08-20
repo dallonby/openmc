@@ -13,8 +13,10 @@
 #include "device/dialect.h"
 #include "device/types.h"
 #include "device/rng.h"
+#include "device/portable_math.h"
 #include "device/geometry.h"
 #include "device/mg.h"
+#include "device/ce.h"
 
 namespace openmc {
 namespace gpu {
@@ -26,6 +28,7 @@ struct FlatModel {
   std::vector<GpuLattice> lattices;
   std::vector<GpuMaterial> materials;
   std::vector<GpuMgMat> mgmats;
+  std::vector<GpuNuclide> nuclides;
   std::vector<int32_t> i32;
   std::vector<float> f32;
 
@@ -45,6 +48,9 @@ struct FlatModel {
 //! Build the flat model. Returns false (with reject_reason set) if the model
 //! uses features outside the GPU engine's v1 envelope.
 bool flatten_model(FlatModel& out);
+
+//! CE-mode data flattening (implemented in flatten_ce.cpp)
+bool flatten_ce(FlatModel& out);
 
 //! Re-flatten only the tally descriptors (tally activation changes per
 //! batch); returns false with reason on unsupported active tallies.

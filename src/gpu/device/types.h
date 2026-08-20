@@ -254,6 +254,19 @@ struct GpuControl {
   float weight_cutoff;
   float weight_survive;
   uint32_gpu mg_bin_avg_off; // f32 arena: MG group mean energies [G]
+  // continuous-energy mode
+  uint32_gpu n_nuclides;
+  uint32_gpu ce_n_log_bins;
+  float ce_log_spacing;
+  uint32_gpu urr_on;
+  uint32_gpu debug_iso_mu; // ablation: force isotropic CM elastic
+  int32_gpu trace_id;      // 1-based particle to trace, or -1
+};
+
+// device trace record (debug)
+struct GpuTraceRec {
+  float code; // 0 fly, 1 collide, 2 elastic, 3 inelastic-mt
+  float a, b, c;
 };
 
 // Runtime counters (device-side atomics), fixed slots in a u32 buffer

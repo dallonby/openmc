@@ -330,6 +330,7 @@ public:
   double integral() const override { return integral_; };
 
 protected:
+  friend struct GpuCeFlatten;
   //! Sample a value (unbiased) from the distribution
   //! \param seed Pseudorandom number seed pointer
   //! \return Sampled value

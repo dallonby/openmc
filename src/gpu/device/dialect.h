@@ -18,10 +18,22 @@
 
 #pragma once
 
+// Deterministic arithmetic across targets: no FMA contraction anywhere in
+// device code (portable_math.h relies on exact operation sequences).
+#pragma STDC FP_CONTRACT OFF
+
 #if defined(__METAL_VERSION__)
 // ---------------------------------------------------------------- Metal ----
 #include <metal_stdlib>
 using namespace metal;
+
+// MSL contracts a*b+c into FMA across statements by default even in safe
+// math mode. That changes rounding in cancellation-sensitive expressions
+// (quadratic discriminants, dot products) enough to bias transport
+// statistically relative to the IEEE host reference. Disable contraction:
+// bitwise agreement with the host-compiled engine matters more than the
+// fused-multiply-add throughput.
+#pragma STDC FP_CONTRACT OFF
 
 #define GPU_TARGET_METAL 1
 #define GLOBAL device

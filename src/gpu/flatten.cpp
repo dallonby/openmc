@@ -498,12 +498,8 @@ bool flatten_tallies(FlatModel& m)
         for (size_t b = 0; b < uf->universes().size(); ++b)
           m.i32[fd.map_off + uf->universes()[b]] = (int32_t)b;
       } else if (auto* ef = dynamic_cast<const EnergyFilter*>(f)) {
-        if (ef->matches_transport_groups()) {
-          return reject(m,
-            fmt::format("tally {} energy filter matches transport groups "
-                        "(unsupported in GPU v1)",
-              t->id()));
-        }
+        // matches_transport_groups needs no special handling here: MG
+        // particles carry the group mean energy, which bins identically
         fd.type = GPU_FILTER_ENERGY;
         fd.n_bins = (uint32_t)ef->bins().size() - 1;
         fd.map_off = push_f32(m, ef->bins().data(), ef->bins().size());
@@ -537,6 +533,12 @@ bool flatten_tallies(FlatModel& m)
       case SCORE_NU_FISSION:
         code = GPU_SCORE_NU_FISSION;
         break;
+      case SCORE_SCATTER:
+        code = GPU_SCORE_SCATTER;
+        break;
+      case 2: // ELASTIC (MT number)
+        code = GPU_SCORE_ELASTIC;
+        break;
       default:
         return reject(m,
           fmt::format(
@@ -558,10 +560,6 @@ bool flatten_model(FlatModel& m)
 {
   m.reject_reason.clear();
 
-  if (settings::run_CE)
-    return reject(m,
-      "continuous-energy mode is not yet in the GPU envelope (multigroup "
-      "only in v1)");
   if (settings::photon_transport)
     return reject(m, "photon transport is not in the GPU envelope");
   if (settings::survival_biasing)
@@ -585,8 +583,13 @@ bool flatten_model(FlatModel& m)
     return false;
   if (!flatten_universes_lattices(m))
     return false;
-  if (!flatten_mg(m))
-    return false;
+  if (settings::run_CE) {
+    if (!flatten_ce(m))
+      return false;
+  } else {
+    if (!flatten_mg(m))
+      return false;
+  }
   if (!flatten_tallies(m))
     return false;
   return true;

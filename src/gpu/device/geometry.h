@@ -67,6 +67,7 @@ struct GpuGeomData {
   GLOBAL const GpuCell* cells;
   GLOBAL const GpuUniverse* universes;
   GLOBAL const GpuLattice* lattices;
+  GLOBAL const GpuMaterial* materials;
   GLOBAL const int32_gpu* i32;
   GLOBAL const float* f32;
 };

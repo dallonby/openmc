@@ -45,6 +45,7 @@ public:
   AngleDistribution& angle() { return angle_; }
 
 private:
+  friend struct GpuCeFlatten;
   AngleDistribution angle_;               //!< Angle distribution
   unique_ptr<EnergyDistribution> energy_; //!< Energy distribution
 };

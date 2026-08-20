@@ -134,6 +134,7 @@ public:
   vector<int> index_inelastic_scatter_;
 
 private:
+  friend struct GpuCeFlatten;
   void create_derived(
     const Function1D* prompt_photons, const Function1D* delayed_photons);
 

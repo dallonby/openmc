@@ -513,8 +513,10 @@ if(OPENMC_USE_METAL)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/dialect.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/types.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/rng.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/portable_math.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/geometry.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/mg.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/ce.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/transport.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/metal_main.h)
   set(MSL_EMBED_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gpu_msl_source.c)
@@ -530,6 +532,7 @@ if(OPENMC_USE_METAL)
     VERBATIM)
   list(APPEND libopenmc_SOURCES
     src/gpu/flatten.cpp
+    src/gpu/flatten_ce.cpp
     src/gpu/runner.cpp
     src/gpu/backend_metal.mm
     ${MSL_EMBED_OUTPUT})

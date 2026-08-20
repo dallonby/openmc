@@ -40,6 +40,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   int primary_flag_; //!< Indicator of whether the photon is a primary or
                      //!< non-primary photon.
   double energy_;    //!< Photon energy or binding energy
@@ -61,6 +62,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   double threshold_;  //!< Energy threshold in lab, (A + 1)/A * |Q|
   double mass_ratio_; //!< (A/(A+1))^2
 };
@@ -82,6 +84,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   //! Outgoing energy for a single incoming energy
   struct CTTable {
     Interpolation interpolation;  //!< Interpolation law
@@ -113,6 +116,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   Tabulated1D theta_; //!< Incoming energy dependent parameter
   double u_;          //!< Restriction energy
 };
@@ -133,6 +137,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   Tabulated1D theta_; //!< Incoming energy dependent parameter
   double u_;          //!< Restriction energy
 };
@@ -153,6 +158,7 @@ public:
   double sample(double E, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   Tabulated1D a_; //!< Energy-dependent 'a' parameter
   Tabulated1D b_; //!< Energy-dependent 'b' parameter
   double u_;      //!< Restriction energy

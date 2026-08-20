@@ -76,6 +76,17 @@ int openmc_run()
   return err;
 }
 
+namespace openmc {
+namespace debug_stats {
+extern double n_collision, n_elastic, n_level, n_cont, n_xn, n_absorb,
+  n_fission_site;
+extern double sum_E_coll, sum_mu_elastic, sum_eratio_elastic, sum_r_coll,
+  sum_r_fsite;
+extern double n_flight, sum_flight_d;
+extern std::vector<uint8_t> leak_map;
+}
+} // namespace openmc
+
 int openmc_simulation_init()
 {
   using namespace openmc;
@@ -172,6 +183,10 @@ int openmc_simulation_init()
   gpu::try_initialize();
 #endif
 
+  if (std::getenv("OPENMC_LEAK_MAP")) {
+    debug_stats::leak_map.assign((size_t)settings::n_particles, 0);
+  }
+
   // Set flag indicating initialization is done
   simulation::initialized = true;
   return 0;
@@ -180,6 +195,29 @@ int openmc_simulation_init()
 int openmc_simulation_finalize()
 {
   using namespace openmc;
+
+  if (std::getenv("OPENMC_STATS")) {
+    using namespace debug_stats;
+    std::fprintf(stderr,
+      "[stats] coll=%.0f elastic=%.0f level=%.0f cont=%.0f xn=%.0f "
+      "absorb=%.0f fsites=%.0f <E_coll>=%.1f <mu_el>=%.6f "
+      "<E'/E_el>=%.6f\n",
+      n_collision, n_elastic, n_level, n_cont, n_xn, n_absorb,
+      n_fission_site, sum_E_coll / n_collision,
+      sum_mu_elastic / n_elastic, sum_eratio_elastic / n_elastic);
+    std::fprintf(stderr,
+      "[stats] <r_coll>=%.6f <r_fsite>=%.6f flights=%.0f <d>=%.6f\n",
+      sum_r_coll / n_collision, sum_r_fsite / n_fission_site, n_flight,
+      sum_flight_d / n_flight);
+  }
+  if (const char* lm = std::getenv("OPENMC_LEAK_MAP")) {
+    if (!debug_stats::leak_map.empty()) {
+      FILE* f = std::fopen(lm, "wb");
+      std::fwrite(
+        debug_stats::leak_map.data(), 1, debug_stats::leak_map.size(), f);
+      std::fclose(f);
+    }
+  }
 
 #ifdef OPENMC_USE_METAL
   gpu::finalize();

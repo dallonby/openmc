@@ -1,5 +1,9 @@
 #include "openmc/physics.h"
 
+#include <vector>
+
+#include <cstdlib>
+
 #include "openmc/bank.h"
 #include "openmc/bremsstrahlung.h"
 #include "openmc/chain.h"
@@ -36,12 +40,41 @@
 
 namespace openmc {
 
+// env-gated transport statistics for GPU-parity debugging
+namespace debug_stats {
+double n_collision, n_elastic, n_level, n_cont, n_xn, n_absorb, n_fission_site;
+double n_flight, sum_flight_d;
+std::vector<uint8_t> leak_map;
+double sum_E_coll, sum_mu_elastic, sum_eratio_elastic, sum_r_coll,
+  sum_r_fsite;
+bool on()
+{
+  static bool v = std::getenv("OPENMC_STATS") != nullptr;
+  return v;
+}
+int64_t trace_id()
+{
+  static int64_t v = std::getenv("OPENMC_TRACE_ID")
+                       ? std::atoll(std::getenv("OPENMC_TRACE_ID"))
+                       : -1;
+  return v;
+}
+} // namespace debug_stats
+
 //==============================================================================
 // Non-member functions
 //==============================================================================
 
 void collision(Particle& p)
 {
+  if (debug_stats::on()) {
+#pragma omp atomic
+    debug_stats::n_collision += 1;
+#pragma omp atomic
+    debug_stats::sum_E_coll += p.E();
+#pragma omp atomic
+    debug_stats::sum_r_coll += p.r().norm();
+  }
   // Add to collision counter for particle
   ++(p.n_collision());
   p.secondary_bank_index() = p.local_secondary_bank().size();
@@ -106,6 +139,10 @@ void sample_neutron_reaction(Particle& p)
 {
   // Sample a nuclide within the material
   int i_nuclide = sample_nuclide(p);
+  if (p.id() == debug_stats::trace_id()) {
+    std::fprintf(stderr, "[T-cpu] collide E=%.7g r=(%.5f %.5f %.5f) nuc=%d\n",
+      p.E(), p.r().x, p.r().y, p.r().z, i_nuclide);
+  }
 
   // Save which nuclide particle had collision with
   p.event_nuclide() = i_nuclide;
@@ -229,6 +266,12 @@ void create_fission_sites(Particle& p, int i_nuclide, const Reaction& rx)
     }
 
     // Set parent and progeny IDs
+    if (debug_stats::on()) {
+#pragma omp atomic
+      debug_stats::n_fission_site += 1;
+#pragma omp atomic
+      debug_stats::sum_r_fsite += p.r().norm();
+    }
     site.parent_id = p.current_work();
     site.progeny_id = p.n_progeny()++;
 
@@ -697,6 +740,10 @@ void absorption(Particle& p, int i_nuclide)
       }
 
       p.wgt() = 0.0;
+      if (debug_stats::on()) {
+#pragma omp atomic
+        debug_stats::n_absorb += 1;
+      }
       p.event() = TallyEvent::ABSORB;
       if (!p.fission()) {
         p.event_mt() = N_DISAPPEAR;
@@ -817,7 +864,10 @@ void elastic_scatter(int i_nuclide, const Reaction& rx, double kT, Particle& p)
   double mu_cm;
   auto& d = rx.products_[0].distribution_[0];
   auto d_ = dynamic_cast<UncorrelatedAngleEnergy*>(d.get());
-  if (!d_->angle().empty()) {
+  // ablation hook for GPU-parity debugging: force isotropic CM elastic
+  if (std::getenv("OPENMC_ISO_MU")) {
+    mu_cm = uniform_distribution(-1., 1., p.current_seed());
+  } else if (!d_->angle().empty()) {
     mu_cm = d_->angle().sample(p.E(), p.current_seed());
   } else {
     mu_cm = uniform_distribution(-1., 1., p.current_seed());
@@ -840,6 +890,18 @@ void elastic_scatter(int i_nuclide, const Reaction& rx, double kT, Particle& p)
   // compute cosine of scattering angle in LAB frame by taking dot product of
   // neutron's pre- and post-collision angle
   p.mu() = p.u().dot(v_n) / vel;
+  if (p.id() == debug_stats::trace_id()) {
+    std::fprintf(stderr, "[T-cpu]   elastic E'=%.7g mu_lab=%.6f\n", p.E(),
+      p.mu());
+  }
+  if (debug_stats::on()) {
+#pragma omp atomic
+    debug_stats::n_elastic += 1;
+#pragma omp atomic
+    debug_stats::sum_mu_elastic += p.mu();
+#pragma omp atomic
+    debug_stats::sum_eratio_elastic += p.E() / p.E_last();
+  }
 
   // Set energy and direction of particle in LAB frame
   p.u() = v_n / vel;
@@ -1152,6 +1214,21 @@ void sample_fission_neutron(
 
 void inelastic_scatter(const Nuclide& nuc, const Reaction& rx, Particle& p)
 {
+  if (p.id() == debug_stats::trace_id()) {
+    std::fprintf(stderr, "[T-cpu]   inelastic MT=%d\n", rx.mt_);
+  }
+  if (debug_stats::on()) {
+    if (rx.mt_ >= 51 && rx.mt_ <= 90) {
+#pragma omp atomic
+      debug_stats::n_level += 1;
+    } else if (rx.mt_ == 91) {
+#pragma omp atomic
+      debug_stats::n_cont += 1;
+    } else {
+#pragma omp atomic
+      debug_stats::n_xn += 1;
+    }
+  }
   // copy energy of neutron
   double E_in = p.E();
 

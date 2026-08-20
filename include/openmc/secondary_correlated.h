@@ -66,6 +66,7 @@ public:
   const vector<CorrTable>& distribution() const { return distribution_; }
 
 private:
+  friend struct GpuCeFlatten;
   int n_region_;                        //!< Number of interpolation regions
   vector<int> breakpoints_;             //!< Breakpoints between regions
   vector<Interpolation> interpolation_; //!< Interpolation laws

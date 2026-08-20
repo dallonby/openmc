@@ -37,6 +37,7 @@ public:
   bool empty() const { return energy_.empty(); }
 
 private:
+  friend struct GpuCeFlatten;
   vector<double> energy_;
   vector<unique_ptr<Tabular>> distribution_;
 };

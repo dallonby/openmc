@@ -161,15 +161,11 @@ DEVICE_FN int32_gpu gpu_mg_sample_scatter(GpuMgView mg, GpuMgMat m,
     float mu0 = -1.0f + (float)k * dmu;
     float p0 = fmu[k];
     float p1 = fmu[k + 1];
-    if (p0 == p1) {
-      mu_out = mu0 + (c - cdf[k]) / p0;
-    } else {
-      float frac = (p1 - p0) / dmu;
-      mu_out =
-        mu0 +
-        (sqrtf(fmaxf(0.0f, p0 * p0 + 2.0f * frac * (c - cdf[k]))) - p0) /
-          frac;
-    }
+    // stable lin-lin inversion (see gpu_sample_tabular)
+    float frac = (p1 - p0) / dmu;
+    float disc = fmaxf(0.0f, p0 * p0 + 2.0f * frac * (c - cdf[k]));
+    float denom = p0 + sqrtf(disc);
+    mu_out = (denom > 0.0f) ? mu0 + 2.0f * (c - cdf[k]) / denom : mu0;
   } else { // histogram
     float dmu = 2.0f / (float)n_mu;
     float c = gpu_prn(seed);

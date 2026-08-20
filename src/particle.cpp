@@ -40,6 +40,13 @@
 
 namespace openmc {
 
+namespace debug_stats {
+extern double n_flight, sum_flight_d;
+bool on();
+int64_t trace_id();
+extern std::vector<uint8_t> leak_map;
+} // namespace debug_stats
+
 //==============================================================================
 // Particle implementation
 //==============================================================================
@@ -294,6 +301,17 @@ void Particle::event_advance()
     std::min({boundary().distance(), collision_distance(), distance_cutoff});
 
   // Advance particle in space and time
+  if (id() == debug_stats::trace_id()) {
+    std::fprintf(stderr,
+      "[T-cpu] fly d=%.7g (coll=%.7g bdry=%.7g) E=%.7g\n", distance,
+      collision_distance(), boundary().distance(), E());
+  }
+  if (debug_stats::on() && type().is_neutron()) {
+#pragma omp atomic
+    debug_stats::n_flight += 1;
+#pragma omp atomic
+    debug_stats::sum_flight_d += distance;
+  }
   this->move_distance(distance);
   double dt = distance / speed;
   this->time() += dt;
@@ -737,6 +755,9 @@ void Particle::cross_surface(const Surface& surf)
 
 void Particle::cross_vacuum_bc(const Surface& surf)
 {
+  if (!debug_stats::leak_map.empty() &&
+      (size_t)(id() - 1) < debug_stats::leak_map.size())
+    debug_stats::leak_map[id() - 1] = 1;
   // Score any surface current tallies -- note that the particle is moved
   // forward slightly so that if the mesh boundary is on the surface, it is
   // still processed

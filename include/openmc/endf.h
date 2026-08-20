@@ -70,6 +70,7 @@ public:
   double operator()(double x) const override;
 
 private:
+  friend struct GpuCeFlatten;
   vector<double> coef_; //!< Polynomial coefficients
 };
 
@@ -95,6 +96,7 @@ public:
   const vector<double>& y() const { return y_; }
 
 private:
+  friend struct GpuCeFlatten;
   std::size_t n_regions_ {0}; //!< number of interpolation regions
   vector<int> nbt_;           //!< values separating interpolation regions
   vector<Interpolation> int_; //!< interpolation schemes

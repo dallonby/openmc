@@ -81,10 +81,11 @@ int omg_metal_compile(void* vctx, const char* src, char* err, int errcap)
   @autoreleasepool {
     NSError* nserr = nil;
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    // fp32 fast math: matches the engine's fp32-first design. Contraction
-    // and reassociation are safe for MC sampling; NaN preservation is not
-    // required because the transport loop guards its own domains.
-    opts.mathMode = MTLMathModeFast;
+    // Precise fp32 math. Fast math's approximate divide/sqrt/log introduce
+    // ~1e-6-level systematic biases that compound over long collision
+    // chains and visibly bias k-eff (observed ~-0.5% on Godiva);
+    // correctness beats the modest ALU win.
+    opts.mathMode = MTLMathModeSafe;
     id<MTLLibrary> lib =
       [ctx->device newLibraryWithSource:@(src) options:opts error:&nserr];
     if (!lib) {

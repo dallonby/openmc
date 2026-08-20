@@ -43,6 +43,12 @@ option(OPENMC_USE_LIBMESH     "Enable support for libMesh unstructured mesh tall
 option(OPENMC_USE_MPI         "Enable MPI"                                           OFF)
 option(OPENMC_USE_UWUW        "Enable UWUW"                                          OFF)
 option(OPENMC_FORCE_VENDORED_LIBS "Explicitly use submodules defined in 'vendor'"    OFF)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+  set(_openmc_metal_default ON)
+else()
+  set(_openmc_metal_default OFF)
+endif()
+option(OPENMC_USE_METAL "Enable Apple Metal GPU transport backend" ${_openmc_metal_default})
 option(OPENMC_ENABLE_STRICT_FP "Enable strict FP flags to improve test portability"  OFF)
 
 message(STATUS "OPENMC_USE_OPENMP ${OPENMC_USE_OPENMP}")
@@ -497,6 +503,40 @@ list(APPEND libopenmc_SOURCES
   src/external/quartic_solver.cpp
   src/external/Faddeeva.cc)
 
+#===============================================================================
+# Apple Metal GPU transport backend
+#===============================================================================
+
+if(OPENMC_USE_METAL)
+  enable_language(OBJCXX)
+  set(MSL_DEVICE_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/dialect.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/types.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/rng.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/geometry.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/mg.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/transport.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/metal_main.h)
+  set(MSL_EMBED_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/gpu_msl_source.c)
+  add_custom_command(
+    OUTPUT ${MSL_EMBED_OUTPUT}
+    COMMAND ${CMAKE_COMMAND}
+      "-DMSL_SOURCES=${MSL_DEVICE_SOURCES}"
+      "-DMSL_OUTPUT=${MSL_EMBED_OUTPUT}"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedMsl.cmake
+    DEPENDS ${MSL_DEVICE_SOURCES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedMsl.cmake
+    COMMENT "Embedding GPU device kernels (MSL)"
+    VERBATIM)
+  list(APPEND libopenmc_SOURCES
+    src/gpu/flatten.cpp
+    src/gpu/runner.cpp
+    src/gpu/backend_metal.mm
+    ${MSL_EMBED_OUTPUT})
+  set_source_files_properties(src/gpu/backend_metal.mm
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
 # Compile the OpenMC sources once so that they can be used by both the
 # production library and the static library used by the C++ unit tests.
 add_library(libopenmc_objects OBJECT ${libopenmc_SOURCES})
@@ -592,6 +632,12 @@ endif()
 
 if (OPENMC_USE_OPENMP)
   target_link_libraries(libopenmc_objects PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if (OPENMC_USE_METAL)
+  target_compile_definitions(libopenmc_objects PUBLIC OPENMC_USE_METAL)
+  target_link_libraries(libopenmc_objects PUBLIC
+    "-framework Metal" "-framework Foundation")
 endif()
 
 if (OPENMC_USE_MPI)

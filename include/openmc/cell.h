@@ -99,6 +99,9 @@ public:
   //! Get Boolean of if the cell is simple or not
   bool is_simple() const { return simple_; }
 
+  //! Get the infix token expression (read-only; used by device flatteners)
+  const vector<int32_t>& expression() const { return expression_; }
+
 private:
   //----------------------------------------------------------------------------
   // Private Methods
@@ -447,6 +450,9 @@ public:
   void to_hdf5_inner(hid_t group_id) const override;
 
   bool is_simple() const override { return region_.is_simple(); }
+
+  //! Read-only region access (used by device flatteners)
+  const Region& region() const { return region_; }
 
   virtual GeometryType geom_type() const override { return GeometryType::CSG; }
 

@@ -41,6 +41,8 @@ public:
 
   void set_universes(span<int32_t> universes);
 
+  const vector<int32_t>& universes() const { return universes_; }
+
 private:
   //----------------------------------------------------------------------------
   // Data members

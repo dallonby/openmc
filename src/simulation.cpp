@@ -8,6 +8,7 @@
 #include "openmc/error.h"
 #include "openmc/event.h"
 #include "openmc/geometry_aux.h"
+#include "openmc/gpu_interface.h"
 #include "openmc/ifp.h"
 #include "openmc/material.h"
 #include "openmc/message_passing.h"
@@ -165,6 +166,12 @@ int openmc_simulation_init()
     openmc_weight_windows_import(settings::weight_windows_file.c_str());
   }
 
+#ifdef OPENMC_USE_METAL
+  // Attempt to bring up the GPU transport engine (no-op unless enabled;
+  // falls back to CPU transport with a warning on any unsupported feature)
+  gpu::try_initialize();
+#endif
+
   // Set flag indicating initialization is done
   simulation::initialized = true;
   return 0;
@@ -173,6 +180,10 @@ int openmc_simulation_init()
 int openmc_simulation_finalize()
 {
   using namespace openmc;
+
+#ifdef OPENMC_USE_METAL
+  gpu::finalize();
+#endif
 
   // Skip if simulation was never run
   if (!simulation::initialized)
@@ -273,7 +284,12 @@ int openmc_next_batch(int* status)
     simulation::time_transport.start();
 
     // Transport loop
-    if (settings::event_based) {
+#ifdef OPENMC_USE_METAL
+    if (gpu::active()) {
+      gpu::transport_generation();
+    } else
+#endif
+      if (settings::event_based) {
       if (settings::use_shared_secondary_bank) {
         transport_event_based_shared_secondary();
       } else {

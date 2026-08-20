@@ -169,6 +169,9 @@ protected:
   double_3dvec fmu;          // The angular distribution histogram
 
 public:
+  // Read-only accessors (used by device flatteners)
+  const double_3dvec& fmu_data() const { return fmu; }
+
   void init(const tensor::Tensor<int>& in_gmin,
     const tensor::Tensor<int>& in_gmax, const double_2dvec& in_mult,
     const double_3dvec& coeffs) override;
@@ -204,6 +207,9 @@ protected:
     ScattDataLegendre& leg, ScattDataTabular& tab);
 
 public:
+  // Read-only accessor (used by device flatteners)
+  const double_3dvec& fmu_data() const { return fmu; }
+
   void init(const tensor::Tensor<int>& in_gmin,
     const tensor::Tensor<int>& in_gmax, const double_2dvec& in_mult,
     const double_3dvec& coeffs) override;

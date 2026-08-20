@@ -156,6 +156,12 @@ public:
 protected:
   bool is_3d_; //!< Has divisions along the z-axis?
 
+public:
+  //! Read-only accessor (used by device flatteners)
+  bool is_3d() const { return is_3d_; }
+
+protected:
+
   virtual void to_hdf5_inner(hid_t group_id) const = 0;
 };
 
@@ -241,6 +247,11 @@ public:
   std::string index_to_string(int indx) const override;
 
   void to_hdf5_inner(hid_t group_id) const override;
+
+  // Read-only accessors (used by device flatteners)
+  const array<int, 3>& n_cells() const { return n_cells_; }
+  const Position& lower_left() const { return lower_left_; }
+  const Position& pitch() const { return pitch_; }
 
 private:
   array<int, 3> n_cells_; //!< Number of cells along each axis

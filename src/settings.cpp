@@ -55,6 +55,7 @@ bool create_fission_neutrons {true};
 bool delayed_photon_scaling {true};
 bool entropy_on {false};
 bool event_based {false};
+bool gpu {false};
 bool ifp_on {false};
 bool legendre_to_tabular {true};
 bool material_cell_offsets {true};
@@ -1227,6 +1228,15 @@ void read_settings_xml(pugi::xml_node root)
   // Check whether to use event-based parallelism
   if (check_for_node(root, "event_based")) {
     event_based = get_node_value_bool(root, "event_based");
+  }
+
+  // Check whether to run transport on a GPU device (environment variable
+  // OPENMC_GPU=1/0 overrides the settings file)
+  if (check_for_node(root, "gpu")) {
+    gpu = get_node_value_bool(root, "gpu");
+  }
+  if (const char* env_gpu = std::getenv("OPENMC_GPU")) {
+    gpu = env_gpu[0] == '1' || env_gpu[0] == 'y' || env_gpu[0] == 't';
   }
 
   // Check whether material cell offsets should be generated

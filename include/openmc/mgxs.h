@@ -81,6 +81,13 @@ private:
   bool equiv(const Mgxs& that);
 
 public:
+  // Read-only accessors (used by device flatteners)
+  const tensor::Tensor<double>& temperatures() const { return kTs; }
+  AngleDistributionType get_scatter_format() const { return scatter_format; }
+  int n_groups() const { return num_groups; }
+  int n_delayed_groups() const { return num_delayed_groups; }
+  const vector<XsData>& xs_data() const { return xs; }
+
   std::string name; // name of dataset, e.g., UO2
   double awr;       // atomic weight ratio
   bool fissionable; // Is this fissionable

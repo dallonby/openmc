@@ -25,23 +25,23 @@
 #include "openmc/constants.h"
 #include "openmc/error.h"
 #include "openmc/geometry.h"
+#include "openmc/material.h"
+#include "openmc/math_functions.h"
 #include "openmc/message_passing.h"
 #include "openmc/mgxs_interface.h"
-#include "openmc/material.h"
 #include "openmc/nuclide.h"
+#include "openmc/particle.h"
+#include "openmc/particle_data.h"
+#include "openmc/random_lcg.h"
 #include "openmc/reaction.h"
 #include "openmc/reaction_product.h"
 #include "openmc/secondary_uncorrelated.h"
-#include "openmc/particle.h"
-#include "openmc/particle_data.h"
-#include "openmc/math_functions.h"
-#include "openmc/random_lcg.h"
 
 namespace openmc {
 // file-scope globals in random_lcg.cpp with external linkage
 extern int64_t master_seed;
 extern uint64_t prn_stride;
-}
+} // namespace openmc
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
 #include "openmc/tallies/tally.h"
@@ -68,8 +68,8 @@ void gpu_host_debug_escape(const GpuGeomState* gs)
 
 namespace {
 struct ReplayStats {
-  double n_coll = 0, n_el = 0, n_lvl = 0, n_cont = 0, n_xn = 0,
-         n_abs = 0, n_fs = 0;
+  double n_coll = 0, n_el = 0, n_lvl = 0, n_cont = 0, n_xn = 0, n_abs = 0,
+         n_fs = 0;
   double sE = 0, smu = 0, ser = 0, sr = 0, srf = 0;
   double n_fl = 0, sd = 0;
 } rstats;
@@ -119,14 +119,13 @@ void gpu_host_leak(int64_gpu id)
 void gpu_host_trace_fly(int64_gpu id, float d, float dc, float db, float E)
 {
   if (id == gpu_trace_id())
-    std::fprintf(stderr, "[T-gpu] fly d=%a seedlo=%.0f bdry=%a E=%a\n", d,
-      dc, db, E);
+    std::fprintf(
+      stderr, "[T-gpu] fly d=%a seedlo=%.0f bdry=%a E=%a\n", d, dc, db, E);
 }
 void gpu_host_trace_collide(int64_gpu id, float E, GpuVec3 r, int32_gpu nuc)
 {
   if (id == gpu_trace_id())
-    std::fprintf(stderr, "[T-gpu] collide E=%a rx=%a nuc=%d\n", E, r.x,
-      nuc);
+    std::fprintf(stderr, "[T-gpu] collide E=%a rx=%a nuc=%d\n", E, r.x, nuc);
 }
 void gpu_host_trace_postfis(
   int64_gpu id, uint32_gpu seedlo, int32_gpu nprog, uint32_gpu urrlo)
@@ -195,13 +194,13 @@ void gpu_host_debug_exit(const GpuGeomState* gs, float distance, float d_coll)
     "ncoord=%d\n",
     gs->coord[0].r.x, gs->coord[0].r.y, gs->coord[0].r.z, gs->coord[0].u.x,
     gs->coord[0].u.y, gs->coord[0].u.z, distance, d_coll, gs->boundary.d,
-    gs->boundary.surface, gs->boundary.coord_level,
-    gs->boundary.lat_trans[0], gs->boundary.lat_trans[1],
-    gs->boundary.lat_trans[2], gs->surface, gs->n_coord);
+    gs->boundary.surface, gs->boundary.coord_level, gs->boundary.lat_trans[0],
+    gs->boundary.lat_trans[1], gs->boundary.lat_trans[2], gs->surface,
+    gs->n_coord);
 }
 
-void gpu_host_debug_lost(const GpuGeomState* gs, int32_gpu tok, GpuVec3 r0,
-  GpuVec3 u0, GpuVec3 u_new)
+void gpu_host_debug_lost(
+  const GpuGeomState* gs, int32_gpu tok, GpuVec3 r0, GpuVec3 u0, GpuVec3 u_new)
 {
   std::fprintf(stderr,
     "[gpu-debug] reflect-lost tok=%d r=(%.7f %.7f %.7f) u_in=(%.6f %.6f "
@@ -353,8 +352,8 @@ void try_initialize()
   }
 
   // compile device source
-  std::string src(reinterpret_cast<const char*>(openmc_gpu_msl),
-    (size_t)openmc_gpu_msl_len);
+  std::string src(
+    reinterpret_cast<const char*>(openmc_gpu_msl), (size_t)openmc_gpu_msl_len);
   char err[4096];
   if (omg_metal_compile(eng.ctx, src.c_str(), err, sizeof(err))) {
     fail(fmt::format("device kernel compilation failed: {}", err));
@@ -411,8 +410,7 @@ void try_initialize()
     fmt::format("GPU transport engine active on {} ({} surfaces, {} cells, "
                 "{} materials, {} tallies flattened)",
       omg_metal_device_name(eng.ctx), eng.flat.surfaces.size(),
-      eng.flat.cells.size(), eng.flat.mgmats.size(),
-      eng.flat.tallies.size()),
+      eng.flat.cells.size(), eng.flat.mgmats.size(), eng.flat.tallies.size()),
     5);
 }
 
@@ -421,8 +419,8 @@ void transport_generation()
   int64_t n = simulation::work_per_rank;
 
   // ---- control block ----
-  auto* ctl = static_cast<GpuControl*>(
-    omg_metal_contents(eng.ctx, OMG_SLOT_CONTROL));
+  auto* ctl =
+    static_cast<GpuControl*>(omg_metal_contents(eng.ctx, OMG_SLOT_CONTROL));
   std::memset(ctl, 0, sizeof(GpuControl));
   ctl->n_particles = (uint32_t)n;
   ctl->source_offset = 0;
@@ -439,11 +437,11 @@ void transport_generation()
   ctl->urr_on = settings::urr_ptables_on ? 1u : 0u;
   ctl->debug_iso_mu = std::getenv("OPENMC_ISO_MU") ? 1u : 0u;
   ctl->trace_id = (int32_t)gpu_trace_id();
-  ctl->max_events = (uint32_t)std::min<int64_t>(
-    settings::max_particle_events, 0x7fffffff);
-  ctl->seed_base = (uint64_t)((simulation::total_gen +
-                                (int64_t)overall_generation_() - 1) *
-                              settings::n_particles);
+  ctl->max_events =
+    (uint32_t)std::min<int64_t>(settings::max_particle_events, 0x7fffffff);
+  ctl->seed_base =
+    (uint64_t)((simulation::total_gen + (int64_t)overall_generation_() - 1) *
+               settings::n_particles);
   ctl->master_seed = (uint64_t)openmc::master_seed;
   ctl->prn_stride = openmc::prn_stride;
   ctl->fission_bank_cap = (uint32_t)(3 * n);
@@ -463,8 +461,8 @@ void transport_generation()
   ctl->n_tallies = tallies_active ? (uint32_t)eng.flat.tallies.size() : 0;
 
   // ---- source upload (fp64 -> fp32) ----
-  auto* src = static_cast<GpuSourceSite*>(
-    omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
+  auto* src =
+    static_cast<GpuSourceSite*>(omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
   double src_weight = 0.0;
   for (int64_t i = 0; i < n; ++i) {
     const SourceSite& s = simulation::source_bank[i];
@@ -626,8 +624,8 @@ void transport_generation()
       double g[4] = {};
       for (uint32_t i = 0; i < gm.n_nuclides; ++i) {
         int32_t in = eng.flat.i32[gm.nuclide_off + i];
-        GpuMicroXS mi = gpu_ce_micro_xs(
-          cev, eng.flat.nuclides[in], Ef, i_log, dummy_seeds);
+        GpuMicroXS mi =
+          gpu_ce_micro_xs(cev, eng.flat.nuclides[in], Ef, i_log, dummy_seeds);
         float dens = eng.flat.f32[gm.density_off + i];
         g[0] += dens * mi.total;
         g[1] += dens * mi.absorption;
@@ -676,8 +674,8 @@ void transport_generation()
       }
       // dump the flattened table nearest 4 MeV
       {
-        const int32_t* ah = eng.flat.i32.data() +
-                            eng.flat.i32[rxh[GPU_RX_DIST] + 1];
+        const int32_t* ah =
+          eng.flat.i32.data() + eng.flat.i32[rxh[GPU_RX_DIST] + 1];
         int n_e = ah[0];
         const float* eg = eng.flat.f32.data() + ah[1];
         int i = 0;
@@ -687,23 +685,21 @@ void transport_generation()
           const int32_t* tb = eng.flat.i32.data() + ah[2 + tt];
           int n_mu = tb[0];
           const float* mu = eng.flat.f32.data() + tb[2];
-          std::fprintf(stderr,
-            "[audit3] table i=%d/%d n_mu=%d interp=%d\n", tt, n_e, n_mu,
-            tb[1]);
+          std::fprintf(stderr, "[audit3] table i=%d/%d n_mu=%d interp=%d\n", tt,
+            n_e, n_mu, tb[1]);
           for (int q = 0; q < n_mu && q < 12; ++q)
-            std::fprintf(stderr, "[audit3]   mu=%+.6f p=%.6f c=%.6f\n",
-              mu[q], mu[n_mu + q], mu[2 * n_mu + q]);
+            std::fprintf(stderr, "[audit3]   mu=%+.6f p=%.6f c=%.6f\n", mu[q],
+              mu[n_mu + q], mu[2 * n_mu + q]);
         }
       }
       uint64_t s1 = 42, s2 = 42;
       for (int it = 0; it < 16; ++it) {
         double eo_c, mu_c;
         rx.products_[0].sample(Ed, eo_c, mu_c, &s1);
-        GpuSampleEA r =
-          gpu_sample_dist(cev, rxh[GPU_RX_DIST], (float)Ed, &s2);
+        GpuSampleEA r = gpu_sample_dist(cev, rxh[GPU_RX_DIST], (float)Ed, &s2);
         std::fprintf(stderr,
-          "[audit3] cpu(E'=%.6g mu=%+.6f)  gpu(E'=%.6g mu=%+.6f)%s\n",
-          eo_c, mu_c, r.E_out, r.mu,
+          "[audit3] cpu(E'=%.6g mu=%+.6f)  gpu(E'=%.6g mu=%+.6f)%s\n", eo_c,
+          mu_c, r.E_out, r.mu,
           (std::abs(mu_c - r.mu) > 1e-3 ||
             std::abs(eo_c - r.E_out) > 1e-3 * eo_c)
             ? "   <-- DIVERGES"
@@ -734,8 +730,8 @@ void transport_generation()
         const Reaction& rx = *nuc.reactions_[nuc.index_inelastic_scatter_[j]];
         for (double Ed : Es) {
           if (Ed < nuc.reactions_[nuc.index_inelastic_scatter_[j]]
-                     ->xs_[0]
-                     .threshold *
+                       ->xs_[0]
+                       .threshold *
                      0)
             continue;
           double c_sum_e = 0, c_sum_mu = 0;
@@ -755,9 +751,8 @@ void transport_generation()
             g_sum_mu += r.mu;
           }
           double ce_ = c_sum_e / NS, ge = g_sum_e / NS;
-          if (ce_ > 0 &&
-              (std::abs(ge - ce_) / ce_ > 3e-3 ||
-                std::abs(g_sum_mu - c_sum_mu) / NS > 3e-3)) {
+          if (ce_ > 0 && (std::abs(ge - ce_) / ce_ > 3e-3 ||
+                           std::abs(g_sum_mu - c_sum_mu) / NS > 3e-3)) {
             std::fprintf(stderr,
               "[audit2] nuc=%u MT=%d E=%.3g  CPU<E'>=%.5g GPU<E'>=%.5g  "
               "CPU<mu>=%.4f GPU<mu>=%.4f\n",
@@ -814,8 +809,7 @@ void transport_generation()
         const int NS = 400000;
         for (int it = 0; it < NS; ++it) {
           float mu = (nuc.elastic_angle >= 0)
-                       ? gpu_sample_angle_dist(
-                           cev, nuc.elastic_angle, E, &seed)
+                       ? gpu_sample_angle_dist(cev, nuc.elastic_angle, E, &seed)
                        : 2.0f * gpu_prn(&seed) - 1.0f;
           sum_mu += mu;
         }
@@ -828,8 +822,8 @@ void transport_generation()
         double gm = sum_mu / NS, cm = c_sum / NS;
         if (std::abs(gm - cm) > 2.5e-3) {
           std::fprintf(stderr,
-            "[audit] nuc=%u E=%.4g GPU<mu>=%.5f CPU<mu>=%.5f diff=%+.5f\n",
-            in, Ed, gm, cm, gm - cm);
+            "[audit] nuc=%u E=%.4g GPU<mu>=%.5f CPU<mu>=%.5f diff=%+.5f\n", in,
+            Ed, gm, cm, gm - cm);
         }
         // full elastic event moments: fp32 gpu path vs fp64 replica of the
         // CPU algorithm (at-rest branch), paired seeds
@@ -845,17 +839,15 @@ void transport_generation()
               GpuVec3 u0 = gpu_v3(0.26726124f, 0.53452248f, 0.80178373f);
               float vel = sqrtf(E);
               GpuVec3 v_n = gpu_scale(u0, vel);
-              GpuVec3 v_cm =
-                gpu_scale(v_n, 1.0f / ((float)A + 1.0f));
+              GpuVec3 v_cm = gpu_scale(v_n, 1.0f / ((float)A + 1.0f));
               v_n = gpu_sub(v_n, v_cm);
               vel = gpu_norm(v_n);
-              float mu_cm = (nuc.elastic_angle >= 0)
-                              ? gpu_sample_angle_dist(
-                                  cev, nuc.elastic_angle, E, &s32)
-                              : 2.0f * gpu_prn(&s32) - 1.0f;
+              float mu_cm =
+                (nuc.elastic_angle >= 0)
+                  ? gpu_sample_angle_dist(cev, nuc.elastic_angle, E, &s32)
+                  : 2.0f * gpu_prn(&s32) - 1.0f;
               GpuVec3 u_cm = gpu_scale(v_n, 1.0f / vel);
-              v_n = gpu_scale(
-                gpu_rotate_angle(u_cm, mu_cm, &s32), vel);
+              v_n = gpu_scale(gpu_rotate_angle(u_cm, mu_cm, &s32), vel);
               v_n = gpu_add(v_n, v_cm);
               float E2 = gpu_dot(v_n, v_n);
               float v2 = sqrtf(E2);
@@ -871,11 +863,9 @@ void transport_generation()
                 vn[0] / (A + 1), vn[1] / (A + 1), vn[2] / (A + 1)};
               for (int q = 0; q < 3; ++q)
                 vn[q] -= vcm[q];
-              vel = std::sqrt(
-                vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
-              double mu_cm = un->angle().empty()
-                               ? 2 * prn(&s64) - 1
-                               : un->angle().sample(Ed, &s64);
+              vel = std::sqrt(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+              double mu_cm = un->angle().empty() ? 2 * prn(&s64) - 1
+                                                 : un->angle().sample(Ed, &s64);
               double ucm[3] = {vn[0] / vel, vn[1] / vel, vn[2] / vel};
               Direction dd =
                 rotate_angle({ucm[0], ucm[1], ucm[2]}, mu_cm, nullptr, &s64);
@@ -884,11 +874,9 @@ void transport_generation()
               vn[2] = dd.z * vel;
               for (int q = 0; q < 3; ++q)
                 vn[q] += vcm[q];
-              double E2 =
-                vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2];
+              double E2 = vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2];
               double v2 = std::sqrt(E2);
-              c_mu_lab +=
-                (u0[0] * vn[0] + u0[1] * vn[1] + u0[2] * vn[2]) / v2;
+              c_mu_lab += (u0[0] * vn[0] + u0[1] * vn[1] + u0[2] * vn[2]) / v2;
               c_de += E2 / Ed;
             }
           }
@@ -962,8 +950,8 @@ void transport_generation()
         "[stats-replay] coll=%.0f elastic=%.0f level=%.0f cont=%.0f "
         "xn=%.0f absorb=%.0f fsites=%.0f <E_coll>=%.1f <mu_el>=%.6f "
         "<E'/E_el>=%.6f\n",
-        rstats.n_coll, rstats.n_el, rstats.n_lvl, rstats.n_cont,
-        rstats.n_xn, rstats.n_abs, rstats.n_fs, rstats.sE / rstats.n_coll,
+        rstats.n_coll, rstats.n_el, rstats.n_lvl, rstats.n_cont, rstats.n_xn,
+        rstats.n_abs, rstats.n_fs, rstats.sE / rstats.n_coll,
         rstats.smu / rstats.n_el, rstats.ser / rstats.n_el);
       std::fprintf(stderr,
         "[stats-replay] <r_coll>=%.6f <r_fsite>=%.6f flights=%.0f "
@@ -986,12 +974,12 @@ void transport_generation()
   auto* ctr =
     static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
   if (ctl->trace_id >= 0) {
-    auto* tr = static_cast<GpuTraceRec*>(
-      omg_metal_contents(eng.ctx, OMG_SLOT_TRACE));
+    auto* tr =
+      static_cast<GpuTraceRec*>(omg_metal_contents(eng.ctx, OMG_SLOT_TRACE));
     uint32_t nrec = std::min(ctr[7], (uint32_t)GPU_TRACE_MAX);
     for (uint32_t i = 0; i < nrec; ++i) {
-      const char* names[5] = {"fly", "collide", "elastic", "inelastic",
-        "postfis"};
+      const char* names[5] = {
+        "fly", "collide", "elastic", "inelastic", "postfis"};
       int code = (int)tr[i].code;
       std::fprintf(stderr, "[T-dev] %s a=%a b=%a c=%a\n",
         names[code < 5 ? code : 0], tr[i].a, tr[i].b, tr[i].c);
@@ -1003,13 +991,11 @@ void transport_generation()
     eng.lost_total += n_lost;
     warning(fmt::format("GPU transport lost {} particles this generation "
                         "({} total; init {} advance {} lattice {} reflect {})",
-      n_lost, eng.lost_total, ctr[GPU_CTR_LOST_INIT],
-      ctr[GPU_CTR_LOST_ADVANCE], ctr[GPU_CTR_LOST_LATTICE],
-      ctr[GPU_CTR_LOST_REFLECT]));
+      n_lost, eng.lost_total, ctr[GPU_CTR_LOST_INIT], ctr[GPU_CTR_LOST_ADVANCE],
+      ctr[GPU_CTR_LOST_LATTICE], ctr[GPU_CTR_LOST_REFLECT]));
   }
   if (ctr[GPU_CTR_SECONDARY_BANK] > 0) {
-    warning(fmt::format(
-      "GPU dropped {} (n,xn) clones (secondary stack full)",
+    warning(fmt::format("GPU dropped {} (n,xn) clones (secondary stack full)",
       ctr[GPU_CTR_SECONDARY_BANK]));
   }
   if (ctr[GPU_CTR_MAX_EVENT_HIT] > 0) {
@@ -1018,8 +1004,8 @@ void transport_generation()
   }
 
   // ---- fission bank + progeny bookkeeping (feeds upstream sort/sync) ----
-  auto* fb = static_cast<GpuSourceSite*>(
-    omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
+  auto* fb =
+    static_cast<GpuSourceSite*>(omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
   simulation::fission_bank.resize(n_sites);
   for (uint32_t i = 0; i < n_sites; ++i) {
     const GpuSourceSite& g = fb[i];
@@ -1099,8 +1085,7 @@ void finalize()
   if (eng.ctx) {
     if (eng.active) {
       write_message(
-        fmt::format("GPU transport device time: {:.3f} s", eng.gpu_seconds),
-        6);
+        fmt::format("GPU transport device time: {:.3f} s", eng.gpu_seconds), 6);
     }
     omg_metal_destroy(eng.ctx);
     eng.ctx = nullptr;

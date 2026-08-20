@@ -25,8 +25,8 @@ void gpu_host_debug_angle(int32_gpu i, float r1, int32_gpu k, float ck,
 
 struct GpuNuclide {
   float awr;
-  float kT;             // selected temperature (eV)
-  uint32_gpu grid_off;  // f32: energy grid, ascending
+  float kT;            // selected temperature (eV)
+  uint32_gpu grid_off; // f32: energy grid, ascending
   uint32_gpu n_grid;
   uint32_gpu loggrid_off; // i32: n_log_bins+1 hash -> grid index
   uint32_gpu xs_off;      // f32: n_grid * 4 (total, abs, fis, nu_fis)
@@ -319,9 +319,8 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
       m.fission = fis;
       m.total = el + inelastic + cap + fis;
       if (nuc.fissionable && fis > 0.0f) {
-        float nu = (nuc.total_nu_f1d >= 0)
-                     ? gpu_f1d(ce, nuc.total_nu_f1d, E)
-                     : 0.0f;
+        float nu =
+          (nuc.total_nu_f1d >= 0) ? gpu_f1d(ce, nuc.total_nu_f1d, E) : 0.0f;
         // total nu falls back to prompt in the flattener when absent
         m.nu_fission = nu * fis;
       } else {
@@ -332,13 +331,13 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
   return m;
 }
 
-DEVICE_FN float gpu_ce_elastic_xs(GpuCeView ce, GpuNuclide nuc,
-  THREAD GpuMicroXS* m)
+DEVICE_FN float gpu_ce_elastic_xs(
+  GpuCeView ce, GpuNuclide nuc, THREAD GpuMicroXS* m)
 {
   if (m->elastic < 0.0f) {
     GLOBAL const float* exs = ce.f32 + nuc.elastic_off;
-    m->elastic = (1.0f - m->interp) * exs[m->i_grid] +
-                 m->interp * exs[m->i_grid + 1];
+    m->elastic =
+      (1.0f - m->interp) * exs[m->i_grid] + m->interp * exs[m->i_grid + 1];
   }
   return m->elastic;
 }
@@ -350,10 +349,9 @@ DEVICE_FN float gpu_ce_elastic_xs(GpuCeView ce, GpuNuclide nuc,
 //! Sample a (histogram | lin-lin) tabular density given arrays x, p, c of
 //! length n with tabulated CDF c (normalized). Mirrors the within-bin logic
 //! of ContinuousTabular::sample / Tabular::sample.
-DEVICE_FN float gpu_sample_tabular(GLOBAL const float* x,
-  GLOBAL const float* p, GLOBAL const float* c, int32_gpu n,
-  int32_gpu n_discrete, int32_gpu interp, float r1, THREAD int32_gpu* k_out,
-  THREAD float* c_k_out)
+DEVICE_FN float gpu_sample_tabular(GLOBAL const float* x, GLOBAL const float* p,
+  GLOBAL const float* c, int32_gpu n, int32_gpu n_discrete, int32_gpu interp,
+  float r1, THREAD int32_gpu* k_out, THREAD float* c_k_out)
 {
   // discrete lines first
   int32_gpu k = 0;
@@ -685,8 +683,7 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     if (km) {
       GLOBAL const float* rr = xe + 3 * n_out;
       GLOBAL const float* aa = xe + 4 * n_out;
-      if (interp == GPU_INTERP_HISTOGRAM || k < n_disc ||
-          xe[k + 1] == xe[k]) {
+      if (interp == GPU_INTERP_HISTOGRAM || k < n_disc || xe[k + 1] == xe[k]) {
         km_r = rr[k];
         km_a = aa[k];
       } else {
@@ -697,8 +694,8 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     }
 
     // unit-base scaling
-    bool scale = km ? (k >= n_disc)
-                    : (!hist_interp && n_out > 1 && k >= n_disc);
+    bool scale =
+      km ? (k >= n_disc) : (!hist_interp && n_out > 1 && k >= n_disc);
     if (scale) {
       GLOBAL const float* xl = ce.f32 + tl[3];
       float El_1 = xl[tl[0]];
@@ -711,13 +708,12 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     if (km) {
       // Kalbach-Mann angle systematics
       if (gpu_prn(seed) > km_r) {
-        float T = (2.0f * gpu_prn(seed) - 1.0f) * (expf(km_a) - expf(-km_a)) *
-                  0.5f;
+        float T =
+          (2.0f * gpu_prn(seed) - 1.0f) * (expf(km_a) - expf(-km_a)) * 0.5f;
         out.mu = logf(T + sqrtf(T * T + 1.0f)) / km_a;
       } else {
         float rr1 = gpu_prn(seed);
-        out.mu =
-          logf(rr1 * expf(km_a) + (1.0f - rr1) * expf(-km_a)) / km_a;
+        out.mu = logf(rr1 * expf(km_a) + (1.0f - rr1) * expf(-km_a)) / km_a;
       }
       if (out.mu > 1.0f)
         out.mu = 1.0f;
@@ -837,9 +833,8 @@ DEVICE_FN GpuVec3 gpu_sample_cxs_target_velocity(
     }
     float beta_vt = sqrtf(beta_vt_sq);
     mu = 2.0f * gpu_prn(seed) - 1.0f;
-    float accept = sqrtf(fmaxf(0.0f,
-                     beta_vn * beta_vn + beta_vt_sq -
-                       2.0f * beta_vn * beta_vt * mu)) /
+    float accept = sqrtf(fmaxf(0.0f, beta_vn * beta_vn + beta_vt_sq -
+                                       2.0f * beta_vn * beta_vt * mu)) /
                    (beta_vn + beta_vt);
     if (gpu_prn(seed) < accept)
       break;

@@ -51,8 +51,7 @@ DEVICE_FN float gpu_norm(GpuVec3 a)
 DEVICE_FN GpuVec3 gpu_rotate(GpuVec3 v, GLOBAL const float* R)
 {
   return gpu_v3(v.x * R[0] + v.y * R[1] + v.z * R[2],
-    v.x * R[3] + v.y * R[4] + v.z * R[5],
-    v.x * R[6] + v.y * R[7] + v.z * R[8]);
+    v.x * R[3] + v.y * R[4] + v.z * R[5], v.x * R[6] + v.y * R[7] + v.z * R[8]);
 }
 // u - 2(n.u)/(n.n) n  (matches Position::reflect)
 DEVICE_FN GpuVec3 gpu_reflect_dir(GpuVec3 u, GpuVec3 n)
@@ -117,8 +116,7 @@ DEVICE_FN float gpu_surf_evaluate(GpuGeomData g, int32_gpu i_surf, GpuVec3 r)
   }
   case GPU_SURF_QUADRIC: {
     float x = r.x, y = r.y, z = r.z;
-    return x * (c[0] * x + c[3] * y + c[6]) +
-           y * (c[1] * y + c[4] * z + c[7]) +
+    return x * (c[0] * x + c[3] * y + c[6]) + y * (c[1] * y + c[4] * z + c[7]) +
            z * (c[2] * z + c[5] * x + c[8]) + c[9];
   }
   }
@@ -304,14 +302,13 @@ DEVICE_FN float gpu_surf_distance(
   }
   case GPU_SURF_QUADRIC: {
     float x = r.x, y = r.y, z = r.z;
-    float A = c[0], B = c[1], C = c[2], D = c[3], E = c[4], F = c[5],
-          G = c[6], H = c[7], J = c[8];
-    float a = A * u.x * u.x + B * u.y * u.y + C * u.z * u.z +
-              D * u.x * u.y + E * u.y * u.z + F * u.x * u.z;
+    float A = c[0], B = c[1], C = c[2], D = c[3], E = c[4], F = c[5], G = c[6],
+          H = c[7], J = c[8];
+    float a = A * u.x * u.x + B * u.y * u.y + C * u.z * u.z + D * u.x * u.y +
+              E * u.y * u.z + F * u.x * u.z;
     float k = (A * u.x * x + B * u.y * y + C * u.z * z +
-                0.5f * (D * (u.x * y + u.y * x) + E * (u.y * z + u.z * y) +
-                         F * (u.x * z + u.z * x) + G * u.x + H * u.y +
-                         J * u.z));
+               0.5f * (D * (u.x * y + u.y * x) + E * (u.y * z + u.z * y) +
+                        F * (u.x * z + u.z * x) + G * u.x + H * u.y + J * u.z));
     float cc = gpu_surf_evaluate(g, i_surf, r);
     float d;
     if (a == 0.0f) {
@@ -414,8 +411,7 @@ DEVICE_FN bool gpu_contains_complex(GpuGeomData g, GLOBAL const int32_gpu* tok,
       } else if (-token == on_surface) {
         in_cell = false;
       } else {
-        bool sense =
-          gpu_surf_sense(g, (token > 0 ? token : -token) - 1, r, u);
+        bool sense = gpu_surf_sense(g, (token > 0 ? token : -token) - 1, r, u);
         in_cell = (sense == (token > 0));
       }
     }
@@ -484,13 +480,12 @@ DEVICE_FN GpuCellDist gpu_cell_distance(
     return none;
   GLOBAL const int32_gpu* tok = g.i32 + c.token_off;
   if (c.simple)
-    return gpu_cell_distance_nearest(g, tok, c.n_tokens, r, u, on_surface,
-      false);
+    return gpu_cell_distance_nearest(
+      g, tok, c.n_tokens, r, u, on_surface, false);
 
   // complex region: advance past virtual crossings until region membership
   // actually changes
-  bool in_region =
-    gpu_contains_complex(g, tok, c.n_tokens, r, u, on_surface);
+  bool in_region = gpu_contains_complex(g, tok, c.n_tokens, r, u, on_surface);
   float d_total = 0.0f;
   GpuVec3 rr = r;
   int32_gpu on = on_surface;
@@ -619,7 +614,7 @@ struct GpuCoord {
 
 struct GpuBoundary {
   float d;
-  int32_gpu surface; // signed token; sign = halfspace being entered
+  int32_gpu surface;     // signed token; sign = halfspace being entered
   int32_gpu coord_level; // 1-based
   int32_gpu lat_trans[3];
 };
@@ -838,8 +833,8 @@ DEVICE_FN void gpu_move_distance(THREAD GpuGeomState* p, float length)
 
 //! cross_lattice: apply the tile translation at the boundary coord level and
 //! recompute local position from the parent frame (mirrors geometry.cpp:359)
-DEVICE_FN bool gpu_cross_lattice(GpuGeomData g, THREAD GpuGeomState* p,
-  int32_gpu root, int32_gpu levels)
+DEVICE_FN bool gpu_cross_lattice(
+  GpuGeomData g, THREAD GpuGeomState* p, int32_gpu root, int32_gpu levels)
 {
   THREAD GpuCoord* c = &p->coord[p->n_coord - 1];
   GpuLattice lat = g.lattices[c->lattice];

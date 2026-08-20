@@ -9,7 +9,8 @@
 #include <string>
 #include <vector>
 
-// device POD definitions, compiled for host
+// device POD definitions compiled for the host — order matters
+// clang-format off
 #include "device/dialect.h"
 #include "device/types.h"
 #include "device/rng.h"
@@ -17,6 +18,9 @@
 #include "device/geometry.h"
 #include "device/mg.h"
 #include "device/ce.h"
+// clang-format on
+
+// device POD definitions, compiled for host
 
 namespace openmc {
 namespace gpu {

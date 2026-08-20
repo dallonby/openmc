@@ -56,9 +56,6 @@
 // stack in kernels. Flattening fails (falls back to CPU) if exceeded.
 #define GPU_MAX_COORD 8
 
-// Maximum region-expression tokens evaluated per cell (guard only).
-#define GPU_MAX_EVENTS_DEFAULT 1000000
-
 // ---------------------------------------------------------------------------
 // Surfaces
 // ---------------------------------------------------------------------------
@@ -96,12 +93,12 @@ struct GpuSurface {
 #define GPU_FILL_LATTICE 2
 
 struct GpuCell {
-  int32_gpu fill_type; // GPU_FILL_*
-  int32_gpu fill;      // universe or lattice index (C_NONE for material)
-  int32_gpu material;  // material index or GPU_MATERIAL_VOID (single-entry)
-  int32_gpu universe;  // universe this cell belongs to
-  float sqrtkT;        // sqrt(k_B T) in sqrt(eV) (single-entry)
-  float density_mult;  // density multiplier
+  int32_gpu fill_type;  // GPU_FILL_*
+  int32_gpu fill;       // universe or lattice index (C_NONE for material)
+  int32_gpu material;   // material index or GPU_MATERIAL_VOID (single-entry)
+  int32_gpu universe;   // universe this cell belongs to
+  float sqrtkT;         // sqrt(k_B T) in sqrt(eV) (single-entry)
+  float density_mult;   // density multiplier
   uint32_gpu token_off; // region tokens: offset into i32 arena
   uint32_gpu n_tokens;  // token count (0 → cell fills all space)
   uint32_gpu simple;    // 1 = intersection-only token list (no operators)
@@ -136,21 +133,7 @@ struct GpuMaterial {
                           // table index (GPU_C_NONE if none), or -1
 };
 
-// MG per-material table layout in the mg f32 arena, all length G or G*G:
-//   [0]              total[G]
-//   [G]              absorption[G]
-//   [2G]             nu_fission[G]
-//   [3G]             fission[G]
-//   [4G]             chi_cdf[G]        (cumulative, chi_cdf[G-1] == 1)
-//   [5G]             scatt_cdf[G*G]    (row g_in: cumulative over g_out)
-//   [5G + G*G]       scatt_mult[G*G]   (weight multiplier nu_scatter ratio)
-//   [5G + 2*G*G]     scatt_xs[G]       (total scattering xs for row norm)
-#define GPU_MG_TOTAL 0
-#define GPU_MG_ABSORPTION 1
-#define GPU_MG_NU_FISSION 2
-#define GPU_MG_FISSION 3
-#define GPU_MG_CHI 4
-#define GPU_MG_SCAT 5
+// (multigroup per-material layout: see GpuMgMat in device/mg.h)
 
 // ---------------------------------------------------------------------------
 // Banks
@@ -188,7 +171,7 @@ struct GpuSourceSite {
 #define GPU_ESTIMATOR_COLLISION 2
 
 struct GpuFilterDesc {
-  uint32_gpu type;    // GPU_FILTER_*
+  uint32_gpu type; // GPU_FILTER_*
   uint32_gpu n_bins;
   uint32_gpu map_off; // cell/material/universe: i32 arena map entity->bin
                       // energy: f32 arena offset of n_bins+1 edges
@@ -203,13 +186,13 @@ struct GpuMesh { // regular structured mesh
 };
 
 struct GpuTallyDesc {
-  uint32_gpu accum_off;  // f32 accumulator arena offset
+  uint32_gpu accum_off; // f32 accumulator arena offset
   uint32_gpu n_filter_bins;
   uint32_gpu n_scores;
-  uint32_gpu estimator;   // GPU_ESTIMATOR_*
-  uint32_gpu filter_off;  // index of first GpuFilterDesc in filter array
+  uint32_gpu estimator;  // GPU_ESTIMATOR_*
+  uint32_gpu filter_off; // index of first GpuFilterDesc in filter array
   uint32_gpu n_filters;
-  uint32_gpu score_off;   // i32 arena offset of score codes
+  uint32_gpu score_off; // i32 arena offset of score codes
 };
 
 // ---------------------------------------------------------------------------
@@ -230,15 +213,15 @@ struct GpuTallyDesc {
 #define GPU_RED_WIDTH 4
 
 struct GpuControl {
-  uint32_gpu n_particles;    // particles this dispatch
-  uint32_gpu source_offset;  // index of first source site in bank
-  uint32_gpu run_mode;       // GPU_RUN_*
-  uint32_gpu energy_mode;    // GPU_MODE_*
-  float keff;                // running keff for fission-site normalization
-  uint32_gpu n_groups;       // MG group count
-  uint32_gpu max_events;     // event cap per particle
-  uint32_gpu n_tallies;      // active tally count
-  uint64_gpu seed_base;      // (total_gen + overall_generation - 1)*n_particles
+  uint32_gpu n_particles;   // particles this dispatch
+  uint32_gpu source_offset; // index of first source site in bank
+  uint32_gpu run_mode;      // GPU_RUN_*
+  uint32_gpu energy_mode;   // GPU_MODE_*
+  float keff;               // running keff for fission-site normalization
+  uint32_gpu n_groups;      // MG group count
+  uint32_gpu max_events;    // event cap per particle
+  uint32_gpu n_tallies;     // active tally count
+  uint64_gpu seed_base;     // (total_gen + overall_generation - 1)*n_particles
   uint64_gpu master_seed;
   uint64_gpu prn_stride;
   uint32_gpu fission_bank_cap;

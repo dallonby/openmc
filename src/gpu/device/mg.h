@@ -29,11 +29,11 @@
 #define GPU_MG_ANGLE_HISTOGRAM 2
 
 struct GpuMgMat {
-  uint32_gpu xs_off;      // f32 arena: GPU_MGV_COUNT vectors of length G
-  uint32_gpu chi_p_off;   // f32: chi_prompt [G][G] probabilities (row = g_in)
-  uint32_gpu dnf_off;     // f32: delayed_nu_fission [ndg][G]
-  uint32_gpu chi_d_off;   // f32: chi_delayed [ndg][G][G]
-  uint32_gpu decay_off;   // f32: decay_rate [ndg]
+  uint32_gpu xs_off;        // f32 arena: GPU_MGV_COUNT vectors of length G
+  uint32_gpu chi_p_off;     // f32: chi_prompt [G][G] probabilities (row = g_in)
+  uint32_gpu dnf_off;       // f32: delayed_nu_fission [ndg][G]
+  uint32_gpu chi_d_off;     // f32: chi_delayed [ndg][G][G]
+  uint32_gpu decay_off;     // f32: decay_rate [ndg]
   uint32_gpu sc_bounds_off; // i32: gmin[G], gmax[G]
   uint32_gpu sc_rowptr_off; // i32: row_ptr[G+1] into per-pair arrays
   uint32_gpu sc_prob_off;   // f32: P0 transfer probabilities (rows concat)
@@ -72,16 +72,15 @@ DEVICE_FN GpuMacroXS gpu_mg_calculate_xs(
   xs.total = gpu_mg_vec(mg, m, GPU_MGV_TOTAL, g) * density_mult;
   xs.absorption = gpu_mg_vec(mg, m, GPU_MGV_ABSORPTION, g) * density_mult;
   xs.fission = gpu_mg_vec(mg, m, GPU_MGV_FISSION, g) * density_mult;
-  xs.nu_fission =
-    m.fissionable ? gpu_mg_vec(mg, m, GPU_MGV_NU_FISSION, g) * density_mult
-                  : 0.0f;
+  xs.nu_fission = m.fissionable
+                    ? gpu_mg_vec(mg, m, GPU_MGV_NU_FISSION, g) * density_mult
+                    : 0.0f;
   return xs;
 }
 
 // rotate_angle (math_functions.cpp:772): rotate direction u by polar cosine
 // mu with azimuth sampled uniformly. Mirrors the CPU pole guard structure.
-DEVICE_FN GpuVec3 gpu_rotate_angle(
-  GpuVec3 u, float mu, THREAD uint64_gpu* seed)
+DEVICE_FN GpuVec3 gpu_rotate_angle(GpuVec3 u, float mu, THREAD uint64_gpu* seed)
 {
   float phi = 6.283185307179586f * gpu_prn(seed);
   float a = sqrtf(fmaxf(0.0f, 1.0f - mu * mu));
@@ -119,8 +118,7 @@ DEVICE_FN GpuVec3 gpu_isotropic_direction(THREAD uint64_gpu* seed)
 //! ScattData::sample_energy + angle sampling + multiplicity.
 //! Returns new group; updates *mu and *wgt.
 DEVICE_FN int32_gpu gpu_mg_sample_scatter(GpuMgView mg, GpuMgMat m,
-  int32_gpu gin, THREAD float* mu, THREAD float* wgt,
-  THREAD uint64_gpu* seed)
+  int32_gpu gin, THREAD float* mu, THREAD float* wgt, THREAD uint64_gpu* seed)
 {
   int32_gpu G = (int32_gpu)mg.n_groups;
   int32_gpu gmin = mg.i32[m.sc_bounds_off + gin];

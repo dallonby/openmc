@@ -64,10 +64,10 @@ bool flatten_surfaces(FlatModel& m)
     } else if (dynamic_cast<const WhiteBC*>(s->bc_.get())) {
       gs.bc = GPU_BC_WHITE;
     } else {
-      return reject(m,
-        fmt::format("surface {} has an unsupported boundary condition "
-                    "(periodic BCs are not yet in the GPU envelope)",
-          s->id_));
+      return reject(
+        m, fmt::format("surface {} has an unsupported boundary condition "
+                       "(periodic BCs are not yet in the GPU envelope)",
+             s->id_));
     }
     if (s->bc_ && s->bc_->has_albedo()) {
       return reject(
@@ -155,10 +155,10 @@ bool flatten_surfaces(FlatModel& m)
       c[9] = p->K_;
       nc = 10;
     } else {
-      return reject(m,
-        fmt::format("surface {} has a type outside the GPU envelope "
-                    "(tori are not yet supported)",
-          s->id_));
+      return reject(
+        m, fmt::format("surface {} has a type outside the GPU envelope "
+                       "(tori are not yet supported)",
+             s->id_));
     }
     gs.coeff_off = push_f32(m, c, nc);
     m.surfaces.push_back(gs);
@@ -173,16 +173,15 @@ bool flatten_cells(FlatModel& m)
     const Cell* c = cp.get();
     auto* csg = dynamic_cast<const CSGCell*>(c);
     if (!csg) {
-      return reject(
-        m, fmt::format("cell {} is not a CSG cell (DAGMC unsupported)",
-             c->id_));
+      return reject(m,
+        fmt::format("cell {} is not a CSG cell (DAGMC unsupported)", c->id_));
     }
     if (c->material_.size() > 1 || c->sqrtkT_.size() > 1 ||
         c->density_mult_.size() > 1) {
-      return reject(m,
-        fmt::format("cell {} uses distributed materials/temperatures/"
-                    "densities (unsupported in GPU v1)",
-          c->id_));
+      return reject(
+        m, fmt::format("cell {} uses distributed materials/temperatures/"
+                       "densities (unsupported in GPU v1)",
+             c->id_));
     }
 
     GpuCell gc {};
@@ -246,10 +245,10 @@ bool flatten_universes_lattices(FlatModel& m)
   for (const auto& lp : model::lattices) {
     auto* rect = dynamic_cast<const RectLattice*>(lp.get());
     if (!rect) {
-      return reject(m,
-        fmt::format(
-          "lattice {} is not rectangular (hex lattices unsupported in v1)",
-          lp->id_));
+      return reject(
+        m, fmt::format(
+             "lattice {} is not rectangular (hex lattices unsupported in v1)",
+             lp->id_));
     }
     GpuLattice gl {};
     gl.nx = rect->n_cells()[0];
@@ -288,21 +287,21 @@ bool flatten_mg(FlatModel& m)
     }
     const Mgxs& mx = mgi.macro_xs_[im];
     if (!mx.is_isotropic) {
-      return reject(m,
-        fmt::format("MG data '{}' is angle-dependent (unsupported in v1)",
-          mx.name));
+      return reject(
+        m, fmt::format(
+             "MG data '{}' is angle-dependent (unsupported in v1)", mx.name));
     }
     if (mx.get_scatter_format() == AngleDistributionType::LEGENDRE) {
-      return reject(m,
-        fmt::format("MG data '{}' retains Legendre scattering; enable "
-                    "tabular_legendre conversion (default) for GPU runs",
-          mx.name));
+      return reject(
+        m, fmt::format("MG data '{}' retains Legendre scattering; enable "
+                       "tabular_legendre conversion (default) for GPU runs",
+             mx.name));
     }
     if (mx.xs_data().size() != 1) {
-      return reject(m,
-        fmt::format("MG data '{}' has multiple temperatures (unsupported "
-                    "in GPU v1)",
-          mx.name));
+      return reject(
+        m, fmt::format("MG data '{}' has multiple temperatures (unsupported "
+                       "in GPU v1)",
+             mx.name));
     }
     const XsData& xd = mx.xs_data()[0];
     int ndg = mx.n_delayed_groups();
@@ -379,10 +378,9 @@ bool flatten_mg(FlatModel& m)
     const auto* tab = dynamic_cast<const ScattDataTabular*>(sd);
     const auto* hist = dynamic_cast<const ScattDataHistogram*>(sd);
     if (!tab && !hist)
-      return reject(m,
-        fmt::format("MG data '{}' has an unsupported scattering "
-                    "representation",
-          mx.name));
+      return reject(m, fmt::format("MG data '{}' has an unsupported scattering "
+                                   "representation",
+                         mx.name));
 
     gm.sc_ang_off = (uint32_t)m.i32.size();
     // reserve descriptor space first (3 ints per pair)
@@ -452,18 +450,18 @@ bool flatten_tallies(FlatModel& m)
       est = GPU_ESTIMATOR_COLLISION;
       break;
     default:
-      return reject(m,
-        fmt::format("tally {} uses the analog estimator (unsupported in "
-                    "GPU v1)",
-          t->id()));
+      return reject(
+        m, fmt::format("tally {} uses the analog estimator (unsupported in "
+                       "GPU v1)",
+             t->id()));
     }
 
     // nuclide bins: only total
     if (t->nuclides_.size() > 1 ||
         (t->nuclides_.size() == 1 && t->nuclides_[0] != -1)) {
-      return reject(m,
-        fmt::format("tally {} has nuclide bins (unsupported in GPU v1)",
-          t->id()));
+      return reject(
+        m, fmt::format(
+             "tally {} has nuclide bins (unsupported in GPU v1)", t->id()));
     }
 
     GpuTallyDesc td {};
@@ -504,10 +502,10 @@ bool flatten_tallies(FlatModel& m)
         fd.n_bins = (uint32_t)ef->bins().size() - 1;
         fd.map_off = push_f32(m, ef->bins().data(), ef->bins().size());
       } else {
-        return reject(m,
-          fmt::format("tally {} has a filter type outside the GPU v1 "
-                      "envelope",
-            t->id()));
+        return reject(
+          m, fmt::format("tally {} has a filter type outside the GPU v1 "
+                         "envelope",
+               t->id()));
       }
       m.filters.push_back(fd);
     }
@@ -540,9 +538,9 @@ bool flatten_tallies(FlatModel& m)
         code = GPU_SCORE_ELASTIC;
         break;
       default:
-        return reject(m,
-          fmt::format(
-            "tally {} has a score outside the GPU v1 envelope", t->id()));
+        return reject(
+          m, fmt::format(
+               "tally {} has a score outside the GPU v1 envelope", t->id()));
       }
       m.i32.push_back(code);
     }
@@ -573,9 +571,9 @@ bool flatten_model(FlatModel& m)
   if (settings::ifp_on)
     return reject(m, "IFP is not in the GPU v1 envelope");
   if (model::n_coord_levels > GPU_MAX_COORD)
-    return reject(m,
-      fmt::format("geometry has {} coordinate levels (GPU supports {})",
-        model::n_coord_levels, GPU_MAX_COORD));
+    return reject(
+      m, fmt::format("geometry has {} coordinate levels (GPU supports {})",
+           model::n_coord_levels, GPU_MAX_COORD));
 
   if (!flatten_surfaces(m))
     return false;

@@ -69,9 +69,8 @@ DEVICE_FN uint64_gpu gpu_future_seed(uint64_gpu n, uint64_gpu seed)
 
 // Mirror of init_particle_seeds (src/random_lcg.cpp:109): one coefficient
 // computation, N_STREAMS multiply-adds.
-DEVICE_FN void gpu_init_particle_seeds(
-  int64_gpu id, uint64_gpu master_seed, uint64_gpu stride,
-  THREAD uint64_gpu* seeds)
+DEVICE_FN void gpu_init_particle_seeds(int64_gpu id, uint64_gpu master_seed,
+  uint64_gpu stride, THREAD uint64_gpu* seeds)
 {
   GpuPrnCoeff k = gpu_future_seed_coefficients((uint64_gpu)id * stride);
   for (int i = 0; i < GPU_N_STREAMS; i++) {

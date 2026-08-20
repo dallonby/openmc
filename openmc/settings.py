@@ -108,6 +108,13 @@ class Settings:
         history-based parallelism.
 
         .. versionadded:: 0.12
+    gpu : bool
+        Indicate whether particle transport should run on a GPU device when
+        the build provides one (Apple Metal backend). Models using features
+        outside the GPU engine's envelope fall back to CPU transport with a
+        warning. The environment variable OPENMC_GPU overrides this setting.
+
+        .. versionadded:: 0.16.1-dev (metal fork)
     free_gas_threshold : float
         Energy multiplier (in units of :math:`kT`) below which the free gas
         scattering treatment is applied for elastic scattering. If not
@@ -484,6 +491,7 @@ class Settings:
         self._log_grid_bins = None
 
         self._event_based = None
+        self._gpu = None
         self._max_particles_in_flight = None
         self._max_particle_events = None
         self._write_initial_source = None
@@ -1269,6 +1277,15 @@ class Settings:
         self._event_based = value
 
     @property
+    def gpu(self) -> bool:
+        return self._gpu
+
+    @gpu.setter
+    def gpu(self, value: bool):
+        cv.check_type('gpu', value, bool)
+        self._gpu = value
+
+    @property
     def max_particles_in_flight(self) -> int:
         return self._max_particles_in_flight
 
@@ -1896,6 +1913,11 @@ class Settings:
             elem = ET.SubElement(root, "event_based")
             elem.text = str(self._event_based).lower()
 
+    def _create_gpu_subelement(self, root):
+        if self._gpu is not None:
+            elem = ET.SubElement(root, "gpu")
+            elem.text = str(self._gpu).lower()
+
     def _create_max_particles_in_flight_subelement(self, root):
         if self._max_particles_in_flight is not None:
             elem = ET.SubElement(root, "max_particles_in_flight")
@@ -2414,6 +2436,11 @@ class Settings:
         if text is not None:
             self.event_based = text in ('true', '1')
 
+    def _gpu_from_xml_element(self, root):
+        text = get_text(root, 'gpu')
+        if text is not None:
+            self.gpu = text in ('true', '1')
+
     def _max_particles_in_flight_from_xml_element(self, root):
         text = get_text(root, 'max_particles_in_flight')
         if text is not None:
@@ -2619,6 +2646,7 @@ class Settings:
         self._create_create_delayed_neutrons_subelement(element)
         self._create_delayed_photon_scaling_subelement(element)
         self._create_event_based_subelement(element)
+        self._create_gpu_subelement(element)
         self._create_max_particles_in_flight_subelement(element)
         self._create_max_events_subelement(element)
         self._create_material_cell_offsets_subelement(element)
@@ -2737,6 +2765,7 @@ class Settings:
         settings._create_delayed_neutrons_from_xml_element(elem)
         settings._delayed_photon_scaling_from_xml_element(elem)
         settings._event_based_from_xml_element(elem)
+        settings._gpu_from_xml_element(elem)
         settings._max_particles_in_flight_from_xml_element(elem)
         settings._max_particle_events_from_xml_element(elem)
         settings._material_cell_offsets_from_xml_element(elem)

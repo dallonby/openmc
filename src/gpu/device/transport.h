@@ -21,8 +21,7 @@ void gpu_host_stat_elastic(float mu_lab, float eratio);
 void gpu_host_stat_inelastic(int32_gpu mt);
 void gpu_host_stat_absorb();
 void gpu_host_stat_flight(float d);
-void gpu_host_trace_fly(
-  int64_gpu id, float d, float dc, float db, float E);
+void gpu_host_trace_fly(int64_gpu id, float d, float dc, float db, float E);
 void gpu_host_trace_collide(int64_gpu id, float E, GpuVec3 r, int32_gpu nuc);
 void gpu_host_trace_elastic(int64_gpu id, float E);
 void gpu_host_trace_inelastic(int64_gpu id, int32_gpu mt);
@@ -47,8 +46,8 @@ struct GpuTallyView {
 };
 
 //! Match one filter; returns bin index or -1.
-DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
-  THREAD const GpuGeomState* gs, float E)
+DEVICE_FN int32_gpu gpu_filter_match(
+  GpuTallyView tv, GpuFilterDesc f, THREAD const GpuGeomState* gs, float E)
 {
   switch (f.type) {
   case GPU_FILTER_CELL: {
@@ -93,8 +92,7 @@ DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
     int32_gpu i = (int32_gpu)floorf((r.x - mesh.llx) / mesh.wx);
     int32_gpu j = (int32_gpu)floorf((r.y - mesh.lly) / mesh.wy);
     int32_gpu k = (int32_gpu)floorf((r.z - mesh.llz) / mesh.wz);
-    if (i < 0 || i >= mesh.nx || j < 0 || j >= mesh.ny || k < 0 ||
-        k >= mesh.nz)
+    if (i < 0 || i >= mesh.nx || j < 0 || j >= mesh.ny || k < 0 || k >= mesh.nz)
       return -1;
     return mesh.nx * mesh.ny * k + mesh.nx * j + i;
   }
@@ -105,9 +103,9 @@ DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
 //! Score all tallies of the given estimator for one event.
 //! coeff: tracklength -> wgt * distance; collision -> wgt / Sigma_t.
 //! Macroscopic score values are supplied by the caller (mode-specific).
-DEVICE_FN void gpu_score_tallies(GpuTallyView tv,
-  THREAD const GpuGeomState* gs, uint32_gpu estimator, float coeff, float E,
-  GpuMacroXS xs, float scat, float elastic)
+DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
+  uint32_gpu estimator, float coeff, float E, GpuMacroXS xs, float scat,
+  float elastic)
 {
   for (uint32_gpu t = 0; t < tv.n_tallies; ++t) {
     GpuTallyDesc td = tv.tallies[t];
@@ -207,8 +205,7 @@ DEVICE_FN float gpu_ce_nu_delayed(GpuCeView ce, GpuNuclide nuc, float E)
 
 //! Full history for one source particle. Mirrors the CPU event loop.
 DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
-  GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuTallyView tv,
-  GpuBanks banks)
+  GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuTallyView tv, GpuBanks banks)
 {
   // ---- initialize_history ----
   GpuSourceSite src = banks.source[ctl.source_offset + tid];
@@ -323,8 +320,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         (float)(seeds[stream] & 0xffffffu), gs.boundary.d, E);
 #endif
       if ((int32_gpu)index_source == ctl.trace_id) {
-        uint32_gpu ti =
-          gpu_atomic_add_u32(banks.counters + 7, 1u);
+        uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
         if (ti < GPU_TRACE_MAX) {
           banks.trace[ti].code = 0.0f;
           banks.trace[ti].a = distance;
@@ -354,12 +350,11 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             }
           } else {
             GpuMgMat m = mg.mats[gs.material];
-            mac_scat =
-              gpu_mg_vec(mg, m, GPU_MGV_SCATT_XS, g) * gs.density_mult;
+            mac_scat = gpu_mg_vec(mg, m, GPU_MGV_SCATT_XS, g) * gs.density_mult;
           }
         }
-        gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_TRACKLENGTH,
-          wgt * distance, E, xs, mac_scat, mac_elastic);
+        gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_TRACKLENGTH, wgt * distance, E,
+          xs, mac_scat, mac_elastic);
       }
       if (distance > GPU_TINY_BIT)
         gs.surface = GPU_SURFACE_NONE;
@@ -391,8 +386,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             gpu_host_leak(index_source);
 #endif
             break;
-          } else if (surf.bc == GPU_BC_REFLECTIVE ||
-                     surf.bc == GPU_BC_WHITE) {
+          } else if (surf.bc == GPU_BC_REFLECTIVE || surf.bc == GPU_BC_WHITE) {
             GpuVec3 r0 = gs.coord[0].r;
             GpuVec3 u0 = gs.coord[0].u;
             GpuVec3 n = gpu_surf_normal(geom, i_surf, r0);
@@ -451,8 +445,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 
         // collision-estimator tallies (pre-collision weight)
         if (tv.n_tallies > 0) {
-          gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_COLLISION, wgt / xs.total,
-            E, xs, mac_scat, mac_elastic);
+          gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_COLLISION, wgt / xs.total, E,
+            xs, mac_scat, mac_elastic);
         }
 
         if (is_ce) {
@@ -462,8 +456,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           uint32_gpu i_sel = 0;
           for (uint32_gpu i = 0; i < mat.n_nuclides; ++i) {
             i_sel = i;
-            prob += geom.f32[mat.density_off + i] * gs.density_mult *
-                    micros[i].total;
+            prob +=
+              geom.f32[mat.density_off + i] * gs.density_mult * micros[i].total;
             if (prob >= cutoff)
               break;
           }
@@ -570,8 +564,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               site.u[2] = uf.z;
               site.parent_id = (int32_gpu)(index_source - 1);
               site.progeny_id = n_progeny;
-              uint32_gpu idx = gpu_atomic_add_u32(
-                banks.counters + GPU_CTR_FISSION_BANK, 1u);
+              uint32_gpu idx =
+                gpu_atomic_add_u32(banks.counters + GPU_CTR_FISSION_BANK, 1u);
               if (idx >= ctl.fission_bank_cap)
                 break;
               ++n_progeny;
@@ -623,8 +617,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 v_t = gpu_sample_cxs_target_velocity(
                   nuc.awr, E, u0, nuc.kT, &seeds[stream]);
               }
-              GpuVec3 v_cm = gpu_scale(gpu_add(v_n, gpu_scale(v_t, nuc.awr)),
-                1.0f / (nuc.awr + 1.0f));
+              GpuVec3 v_cm = gpu_scale(
+                gpu_add(v_n, gpu_scale(v_t, nuc.awr)), 1.0f / (nuc.awr + 1.0f));
               v_n = gpu_sub(v_n, v_cm);
               vel = gpu_norm(v_n);
               float mu_cm;
@@ -667,8 +661,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                     mic->i_grid - thr + 1 < rxh[GPU_RX_NXS]) {
                   GLOBAL const float* rxs = ce.f32 + rxh[GPU_RX_XSOFF];
                   int32_gpu k = mic->i_grid - thr;
-                  pr += (1.0f - mic->interp) * rxs[k] +
-                        mic->interp * rxs[k + 1];
+                  pr +=
+                    (1.0f - mic->interp) * rxs[k] + mic->interp * rxs[k + 1];
                 }
               }
               GLOBAL const int32_gpu* rx = ce.i32 + rx_off;
@@ -695,8 +689,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 float A = nuc.awr;
                 float E_cm = E_out;
                 E_out =
-                  E_cm + (E_in + 2.0f * mu * (A + 1.0f) *
-                                   sqrtf(E_in * E_cm)) /
+                  E_cm + (E_in + 2.0f * mu * (A + 1.0f) * sqrtf(E_in * E_cm)) /
                            ((A + 1.0f) * (A + 1.0f));
                 mu = mu * sqrtf(E_cm / E_out) +
                      1.0f / (A + 1.0f) * sqrtf(E_in / E_out);
@@ -776,8 +769,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               }
               site.parent_id = (int32_gpu)(index_source - 1);
               site.progeny_id = n_progeny;
-              uint32_gpu idx = gpu_atomic_add_u32(
-                banks.counters + GPU_CTR_FISSION_BANK, 1u);
+              uint32_gpu idx =
+                gpu_atomic_add_u32(banks.counters + GPU_CTR_FISSION_BANK, 1u);
               if (idx >= ctl.fission_bank_cap)
                 break;
               ++n_progeny;
@@ -796,8 +789,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             float mu;
             int32_gpu gout =
               gpu_mg_sample_scatter(mg, m, g, &mu, &wgt, &seeds[stream]);
-            gs.coord[0].u =
-              gpu_rotate_angle(gs.coord[0].u, mu, &seeds[stream]);
+            gs.coord[0].u = gpu_rotate_angle(gs.coord[0].u, mu, &seeds[stream]);
             g = gout;
             E = geom.f32[ctl.mg_bin_avg_off + g];
           }

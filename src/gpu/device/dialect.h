@@ -60,7 +60,7 @@ typedef uchar uint8_gpu;
 #define fmaxf(x, y) metal::fmax(x, y)
 #define floorf(x) metal::floor(x)
 #define ceilf(x) metal::ceil(x)
-#define lroundf(x) (int64_gpu)metal::rint(x)
+#define lroundf(x) (int64_gpu) metal::rint(x)
 #define copysignf(x, y) metal::copysign(x, y)
 #define sinf(x) metal::sin(x)
 #define cosf(x) metal::cos(x)

@@ -170,8 +170,8 @@ struct GpuCeFlatten {
 
   int32_t cont_tab(const ContinuousTabular* ct)
   {
-    bool hist = (ct->n_region_ == 1 &&
-                 ct->interpolation_[0] == Interpolation::histogram);
+    bool hist =
+      (ct->n_region_ == 1 && ct->interpolation_[0] == Interpolation::histogram);
     size_t n = ct->energy_.size();
     std::vector<int32_t> tbl(n);
     for (size_t i = 0; i < n; ++i) {
@@ -345,8 +345,8 @@ bool flatten_ce(FlatModel& m)
     kts.insert(c->sqrtkT_[0] * c->sqrtkT_[0]);
   }
   if (kts.size() > 1)
-    return reject_ce(m,
-      "multiple cell temperatures (single-temperature CE only in GPU v1)");
+    return reject_ce(
+      m, "multiple cell temperatures (single-temperature CE only in GPU v1)");
   double model_kT = kts.empty() ? 2.53e-2 : *kts.begin();
 
   m.nuclides.clear();
@@ -401,8 +401,8 @@ bool flatten_ce(FlatModel& m)
     {
       const auto& el = nuc.reactions_[0]->xs_[i_temp];
       if (el.threshold != 0 || el.value.size() != ng)
-        return reject_ce(m,
-          fmt::format("nuclide {} elastic grid mismatch", nuc.name_));
+        return reject_ce(
+          m, fmt::format("nuclide {} elastic grid mismatch", nuc.name_));
       gn.elastic_off = fx.push_fc(el.value);
     }
 
@@ -412,8 +412,7 @@ bool flatten_ce(FlatModel& m)
         nuc.reactions_[0]->products_[0].distribution_[0].get());
       if (!d)
         return reject_ce(m,
-          fmt::format("nuclide {} elastic law is not uncorrelated",
-            nuc.name_));
+          fmt::format("nuclide {} elastic law is not uncorrelated", nuc.name_));
       gn.elastic_angle = fx.uncorr_angle(d);
     }
 
@@ -461,8 +460,7 @@ bool flatten_ce(FlatModel& m)
           int32_t d = fx.product_dist(prod);
           if (d < 0)
             return reject_ce(m,
-              fmt::format("nuclide {} fission product: {}", nuc.name_,
-                fx.err));
+              fmt::format("nuclide {} fission product: {}", nuc.name_, fx.err));
           double dr = prod.decay_rate_;
           prods.push_back(y);
           prods.push_back(d);
@@ -490,9 +488,8 @@ bool flatten_ce(FlatModel& m)
       int32_t y = fx.f1d(rx.products_[0].yield_.get());
       int32_t d = fx.product_dist(rx.products_[0]);
       if (d < 0)
-        return reject_ce(m,
-          fmt::format(
-            "nuclide {} MT={}: {}", nuc.name_, rx.mt_, fx.err));
+        return reject_ce(
+          m, fmt::format("nuclide {} MT={}: {}", nuc.name_, rx.mt_, fx.err));
       double q = rx.q_value_;
       int32_t hdr = fx.i32_off();
       m.i32.push_back(rx.mt_);
@@ -517,8 +514,7 @@ bool flatten_ce(FlatModel& m)
       if (u.interp_ != Interpolation::lin_lin &&
           u.interp_ != Interpolation::log_log)
         return reject_ce(m,
-          fmt::format("nuclide {} URR interpolation unsupported",
-            nuc.name_));
+          fmt::format("nuclide {} URR interpolation unsupported", nuc.name_));
       int n_e = (int)u.n_energy();
       int n_b = (int)u.n_cdf();
       // inelastic competition reaction header
@@ -570,13 +566,13 @@ bool flatten_ce(FlatModel& m)
   for (const auto& mp : model::materials) {
     const Material& mat = *mp;
     if (!mat.thermal_tables_.empty())
-      return reject_ce(m,
-        fmt::format("material {} uses S(a,b) thermal scattering "
-                    "(unsupported in GPU v1 — see docs/metal_port)",
-          mat.id_));
+      return reject_ce(
+        m, fmt::format("material {} uses S(a,b) thermal scattering "
+                       "(unsupported in GPU v1 — see docs/metal_port)",
+             mat.id_));
     if (mat.nuclide_.size() > 32)
-      return reject_ce(m,
-        fmt::format("material {} has more than 32 nuclides", mat.id_));
+      return reject_ce(
+        m, fmt::format("material {} has more than 32 nuclides", mat.id_));
     GpuMaterial gm {};
     gm.n_nuclides = (uint32_t)mat.nuclide_.size();
     gm.nuclide_off = fx.i32_off();

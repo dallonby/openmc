@@ -25,6 +25,7 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   device gpu_atomic_f32* tally_accum [[buffer(17)]],
   const device GpuNuclide* nuclides [[buffer(18)]],
   device GpuTraceRec* trace_buf [[buffer(19)]],
+  device const GpuSabTable* sab_tables [[buffer(20)]],
   uint tid [[thread_position_in_grid]])
 {
   if (tid >= ctl.n_particles)
@@ -56,6 +57,11 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   mg.f32 = f32_arena;
   mg.n_groups = ctl.n_groups;
 
+  GpuSabView sab;
+  sab.tables = sab_tables;
+  sab.i32 = i32_arena;
+  sab.f32 = f32_arena;
+
   GpuTallyView tv;
   tv.tallies = tally_descs;
   tv.filters = filter_descs;
@@ -73,7 +79,7 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   banks.red_slots = red_slots;
   banks.trace = trace_buf;
 
-  gpu_run_particle(tid, ctl, geom, mg, ce, tv, banks);
+  gpu_run_particle(tid, ctl, geom, mg, ce, sab, tv, banks);
 }
 
 // Math-function probe: y = f(x) for the host to compare against libm

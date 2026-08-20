@@ -96,6 +96,7 @@ the mean flight length).
 |---|---|---|---|
 | 7-group MG 3x3 pin lattice, 10M active | k=1.34156(24) | k=1.34193(25) | 1.1 sigma |
 | CE PWR pincell (no S(a,b)), 3M active | k=1.23939(57) | k=1.23971(53) | 0.4 sigma; 58 tally bins mean z^2 = 0.88-1.01 |
+| CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23672(47) | 0.3 sigma; 58 tally bins mean z^2 = 0.23-1.25 |
 | CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=0.99499(71) | **-630 pcm — open item, see below** |
 
 Lost particles: ~1e-4 of histories (pincell), 0 (Godiva), ~7e-6 (MG
@@ -119,14 +120,12 @@ lattice); counted and warned per generation.
    candidates are a Metal compiler transform in the branchy tabular-scan
    loops or an unnoticed address-space aliasing effect. Moderated systems
    are unaffected (pincell 0.4 sigma).
-2. S(a,b) thermal scattering (flattener rejects; the standard LWR pincell
-   falls back to CPU unless built with `--no-sab` materials).
-3. Fixed-source mode, MPI, photon transport, DAGMC, hex lattices, tori,
+2. Fixed-source mode, MPI, photon transport, DAGMC, hex lattices, tori,
    periodic BCs, survival biasing, weight windows, multi-temperature
    models, distribcell — all detected and fall back to CPU with a warning.
-4. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
+3. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
    the table for CE); unionized/material-major energy grids.
-5. CUDA backend: the dialect and backend ABI are in place
+4. CUDA backend: the dialect and backend ABI are in place
    (`src/gpu/device/dialect.h`, `src/gpu/backend.h`); needs
    `backend_cuda.cu` implementing the same slots and a kernel wrapper, plus
    `-ffp-contract=off`/`--fmad=false` for bit parity with the portable

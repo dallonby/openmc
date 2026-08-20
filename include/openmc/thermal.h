@@ -72,6 +72,7 @@ public:
     double mu, double& E_out, uint64_t* seed) const;
 
 private:
+  friend struct GpuCeFlatten;
   struct Reaction {
     // Default constructor
     Reaction() {}

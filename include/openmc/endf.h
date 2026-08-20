@@ -134,6 +134,7 @@ public:
   double operator()(double E) const override;
 
 private:
+  friend struct GpuCeFlatten;
   double bound_xs_; //!< Characteristic bound xs in [b]
   double
     debye_waller_; //!< Debye-Waller integral divided by atomic mass in [eV^-1]

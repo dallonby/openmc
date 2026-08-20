@@ -17,6 +17,8 @@
 #include "device/portable_math.h"
 #include "device/geometry.h"
 #include "device/mg.h"
+#include "device/f1d.h"
+#include "device/sab.h"
 #include "device/ce.h"
 // clang-format on
 
@@ -33,6 +35,7 @@ struct FlatModel {
   std::vector<GpuMaterial> materials;
   std::vector<GpuMgMat> mgmats;
   std::vector<GpuNuclide> nuclides;
+  std::vector<GpuSabTable> sab_tables;
   std::vector<int32_t> i32;
   std::vector<float> f32;
 

@@ -89,7 +89,7 @@ run proceeds normally on the CPU.
 | Supported | Falls back to CPU |
 |---|---|
 | k-eigenvalue runs | fixed-source, photon transport, MPI |
-| Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic, level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission | S(a,b) thermal scattering, windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models |
+| Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic, S(a,b) thermal scattering (coherent/incoherent elastic, continuous + discrete inelastic), level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission | windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models, NCrystal |
 | Multigroup: macroscopic isotropic MGXS, tabular/histogram scattering laws, prompt + delayed fission | angle-dependent MGXS, Legendre sampling (use the default `tabular_legendre` conversion) |
 | CSG: all quadric surface types, universes, rectangular lattices, translations/rotations, vacuum/reflective/white BCs | tori, hex lattices, periodic BCs, boundary albedo, DAGMC, distribcell/multi-instance materials |
 | Tallies: cell/material/universe/energy/mesh filters; flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | analog estimators, nuclide bins, other filters/scores |
@@ -101,16 +101,27 @@ run proceeds normally on the CPU.
 |---|---|---|---|
 | 7-group MG 3×3 pin lattice (10M active histories) | 1.34156 ± 0.00024 | 1.34193 ± 0.00025 | 1.1σ |
 | CE PWR pincell, no S(a,b) (3M active) | 1.23939 ± 0.00057 | 1.23971 ± 0.00053 | 0.4σ; 58 tally bins, mean z² = 0.88–1.01 |
+| CE PWR pincell **with S(a,b)** (3M active) | 1.23691 ± 0.00054 | 1.23672 ± 0.00047 | 0.3σ; 58 tally bins, mean z² = 0.23–1.25 |
 | CE Godiva bare HEU sphere (1M active) | 1.00125 ± 0.00059 | 0.99499 ± 0.00071 | −630 pcm on this 57%-leakage benchmark — known open item (device-arithmetic ensemble effect; see `PORT_NOTES.md`) |
 
 ## Performance
 
-See `PORT_NOTES.md` and the benchmark table in the branch discussion;
-representative numbers on an M3 Ultra (80-core GPU) vs the same tree's CPU
-build on 28 threads: multigroup ~2.6M particles/s (GPU) vs ~0.3M (CPU);
-thermal CE pincell ~0.7M/s vs ~21k/s (~34×). GPU throughput improves with
-larger `particles` per batch (the GPU is under-occupied below ~10^5
-particles in flight).
+Active-batch calculation rates with tallies enabled, M3 Ultra (80-core
+GPU) vs the same tree's CPU build on 28 threads (solo runs):
+
+| Case | particles/batch | CPU | GPU | Speedup |
+|---|---|---|---|---|
+| MG 7-group pin lattice | 10k | 34.7k/s | 1.23M/s | 35× |
+| MG 7-group pin lattice | 100k | 37.1k/s | 3.29M/s | 89× |
+| MG 7-group pin lattice | 1M | 39.8k/s | 3.93M/s | **99×** |
+| CE pincell (no S(a,b)) | 20k | 26.0k/s | 687k/s | 26× |
+| CE pincell (no S(a,b)) | 500k | — | 1.28M/s | ~49× |
+| CE pincell with S(a,b) | 20k | 17.1k/s | 590k/s | 35× |
+| CE Godiva (fast) | 100k | 463k/s | 5.79M/s | 12.5× |
+| CE Godiva (fast) | 1M | — | 10.8M/s | ~23× |
+
+GPU throughput improves with larger `particles` per batch (the GPU is
+under-occupied below ~10^5 particles in flight).
 
 ## Architecture
 

@@ -131,6 +131,7 @@ struct GpuMaterial {
   int32_gpu mg_off;       // MG mode: offset into mg f32 arena, or -1
   int32_gpu sab_off;      // CE mode: i32 arena offset of per-nuclide S(a,b)
                           // table index (GPU_C_NONE if none), or -1
+  int32_gpu sab_frac_off; // f32 arena: per-nuclide S(a,b) fraction
 };
 
 // (multigroup per-material layout: see GpuMgMat in device/mg.h)

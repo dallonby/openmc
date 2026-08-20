@@ -64,15 +64,6 @@ struct GpuNuclide {
 #define GPU_RX_DIST 7
 #define GPU_RX_WORDS 8
 
-// Function1D blob (i32 arena):
-//   [0] type: 0 polynomial, 1 tabulated
-//   [1] n (coefficients or pairs)
-//   [2] f32 offset (poly: coef[n]; tab: x[n] then y[n])
-//   [3] n_regions (tabulated)
-//   [4] region-pair offset in i32 arena: (nbt[i], interp[i]) pairs
-#define GPU_F1D_POLY 0
-#define GPU_F1D_TAB 1
-
 // AngleEnergy distribution descriptor types
 #define GPU_DIST_LEVEL 0
 #define GPU_DIST_CONT_TAB 1
@@ -84,13 +75,6 @@ struct GpuNuclide {
 #define GPU_DIST_NBODY 7
 #define GPU_DIST_CORRELATED 8
 #define GPU_DIST_MULTI 9 // applicability-weighted set of distributions
-
-// interpolation codes (match openmc::Interpolation)
-#define GPU_INTERP_HISTOGRAM 1
-#define GPU_INTERP_LINLIN 2
-#define GPU_INTERP_LINLOG 3
-#define GPU_INTERP_LOGLIN 4
-#define GPU_INTERP_LOGLOG 5
 
 struct GpuCeView {
   GLOBAL const GpuNuclide* nuclides;
@@ -111,6 +95,10 @@ struct GpuMicroXS {
   float fission;
   float nu_fission;
   float elastic; // < 0 -> not yet computed
+  float thermal; // bound S(a,b) elastic+inelastic (scaled by sab_frac)
+  float thermal_elastic;
+  float sab_frac;
+  int32_gpu i_sab; // thermal table index or -1
   int32_gpu i_grid;
   float interp;
   uint32_gpu use_ptable;
@@ -122,71 +110,26 @@ struct GpuMicroXS {
 
 DEVICE_FN float gpu_f1d(GpuCeView ce, int32_gpu blob, float x)
 {
-  GLOBAL const int32_gpu* h = ce.i32 + blob;
-  int32_gpu type = h[0];
-  int32_gpu n = h[1];
-  GLOBAL const float* d = ce.f32 + h[2];
-  if (type == GPU_F1D_POLY) {
-    float y = 0.0f;
-    for (int32_gpu i = n - 1; i >= 0; --i)
-      y = y * x + d[i];
-    return y;
-  }
-  // tabulated
-  GLOBAL const float* xv = d;
-  GLOBAL const float* yv = d + n;
-  if (x <= xv[0])
-    return yv[0];
-  if (x >= xv[n - 1])
-    return yv[n - 1];
-  // binary search: largest i with xv[i] <= x
-  int32_gpu lo = 0, hi = n - 1;
-  while (hi - lo > 1) {
-    int32_gpu mid = (lo + hi) / 2;
-    if (x >= xv[mid])
-      lo = mid;
-    else
-      hi = mid;
-  }
-  int32_gpu interp = GPU_INTERP_LINLIN;
-  int32_gpu n_regions = h[3];
-  if (n_regions > 0) {
-    GLOBAL const int32_gpu* reg = ce.i32 + h[4];
-    for (int32_gpu j = 0; j < n_regions; ++j) {
-      if (lo < reg[2 * j]) {
-        interp = reg[2 * j + 1];
-        break;
-      }
-    }
-  }
-  float x0 = xv[lo], x1 = xv[lo + 1];
-  float y0 = yv[lo], y1 = yv[lo + 1];
-  if (interp == GPU_INTERP_HISTOGRAM)
-    return y0;
-  if (x1 == x0)
-    return y0;
-  switch (interp) {
-  case GPU_INTERP_LINLIN:
-    return y0 + (x - x0) / (x1 - x0) * (y1 - y0);
-  case GPU_INTERP_LINLOG:
-    return y0 + logf(x / x0) / logf(x1 / x0) * (y1 - y0);
-  case GPU_INTERP_LOGLIN:
-    return y0 * expf((x - x0) / (x1 - x0) * logf(y1 / y0));
-  default: // log-log
-    return y0 * expf(logf(x / x0) / logf(x1 / x0) * logf(y1 / y0));
-  }
+  return gpu_f1d_view(ce.i32, ce.f32, blob, x);
 }
+
 
 // ---------------------------------------------------------------------------
 // XS lookup
 // ---------------------------------------------------------------------------
 
-//! Nuclide::calculate_xs equivalent (single temperature, no S(a,b)).
+//! Nuclide::calculate_xs equivalent (single temperature), including the
+//! S(a,b) blending of calculate_sab_xs when i_sab >= 0.
 DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
-  int32_gpu i_log, THREAD uint64_gpu* seeds)
+  int32_gpu i_log, int32_gpu i_sab, float sab_frac, GpuSabView sab,
+  THREAD uint64_gpu* seeds)
 {
   GpuMicroXS m;
   m.elastic = -1.0f;
+  m.thermal = 0.0f;
+  m.thermal_elastic = 0.0f;
+  m.sab_frac = 0.0f;
+  m.i_sab = -1;
   m.use_ptable = 0;
 
   GLOBAL const float* grid = ce.f32 + nuc.grid_off;
@@ -227,6 +170,22 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
   } else {
     m.fission = 0.0f;
     m.nu_fission = 0.0f;
+  }
+
+  // S(a,b) blending (nuclide.cpp:835 calculate_sab_xs); the caller gates
+  // i_sab on E < table.energy_max
+  if (i_sab >= 0) {
+    GpuSabTable t = sab.tables[i_sab];
+    float el_b, inel_b;
+    gpu_sab_xs(sab, t, E, &el_b, &inel_b);
+    m.thermal = sab_frac * (el_b + inel_b);
+    m.thermal_elastic = sab_frac * el_b;
+    GLOBAL const float* exs = ce.f32 + nuc.elastic_off;
+    float el_free = (1.0f - f) * exs[i_grid] + f * exs[i_grid + 1];
+    m.total = m.total + m.thermal - sab_frac * el_free;
+    m.elastic = m.thermal + (1.0f - sab_frac) * el_free;
+    m.i_sab = i_sab;
+    m.sab_frac = sab_frac;
   }
 
   // URR probability tables
@@ -479,11 +438,6 @@ DEVICE_FN float gpu_watt_spectrum(float a, float b, THREAD uint64_gpu* seed)
   float u = 2.0f * gpu_prn(seed) - 1.0f;
   return w + 0.25f * a * a * b + u * sqrtf(a * b * w);
 }
-
-struct GpuSampleEA {
-  float E_out;
-  float mu;
-};
 
 //! Sample one AngleEnergy distribution (descriptor at `blob`).
 //! Mirrors the per-law algorithms including RN order.

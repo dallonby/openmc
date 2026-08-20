@@ -26,8 +26,10 @@
 #include "openmc/secondary_kalbach.h"
 #include "openmc/secondary_nbody.h"
 #include "openmc/secondary_uncorrelated.h"
+#include "openmc/secondary_thermal.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
+#include "openmc/thermal.h"
 #include "openmc/urr.h"
 
 namespace openmc {
@@ -261,6 +263,185 @@ struct GpuCeFlatten {
   int32_t uncorr_angle(const UncorrelatedAngleEnergy* d)
   {
     return angle_dist(d->angle_);
+  }
+
+  // ---- S(a,b) thermal laws ----
+  int32_t coherent_el_blob(const CoherentElasticXS& xs)
+  {
+    size_t n = xs.bragg_edges().size();
+    uint32_t eoff = push_fc(xs.bragg_edges());
+    uint32_t foff = push_fc(xs.factors());
+    int32_t hdr = (int32_t)i32_off();
+    m.i32.push_back(GPU_TDIST_COH_EL);
+    m.i32.push_back((int32_t)n);
+    m.i32.push_back((int32_t)eoff);
+    m.i32.push_back((int32_t)foff);
+    return hdr;
+  }
+
+  int32_t sab_dist(const AngleEnergy* ae, int table_index)
+  {
+    if (auto* c = dynamic_cast<const CoherentElasticAE*>(ae)) {
+      return coherent_el_blob(c->xs_);
+    }
+    if (auto* ie = dynamic_cast<const IncoherentElasticAE*>(ae)) {
+      double d[2] = {0.0, ie->debye_waller_};
+      int32_t hdr = (int32_t)i32_off();
+      m.i32.push_back(GPU_TDIST_INCOH_EL);
+      m.i32.push_back((int32_t)push_f(d, 2));
+      return hdr;
+    }
+    if (auto* ied = dynamic_cast<const IncoherentElasticAEDiscrete*>(ae)) {
+      int n_e = (int)ied->energy_.size();
+      int n_mu = (int)ied->mu_out_.shape(1);
+      uint32_t eoff = push_fc(ied->energy_);
+      uint32_t moff = f32_off();
+      for (int i = 0; i < n_e; ++i)
+        for (int k = 0; k < n_mu; ++k)
+          m.f32.push_back((float)ied->mu_out_(i, k));
+      int32_t hdr = (int32_t)i32_off();
+      m.i32.push_back(GPU_TDIST_INCOH_EL_DISC);
+      m.i32.push_back(n_e);
+      m.i32.push_back((int32_t)eoff);
+      m.i32.push_back(n_mu);
+      m.i32.push_back((int32_t)moff);
+      return hdr;
+    }
+    if (auto* id = dynamic_cast<const IncoherentInelasticAEDiscrete*>(ae)) {
+      int n_e = (int)id->energy_.size();
+      int n_out = (int)id->energy_out_.shape(1);
+      int n_mu = (int)id->mu_out_.shape(2);
+      uint32_t eoff = push_fc(id->energy_);
+      uint32_t eooff = f32_off();
+      for (int i = 0; i < n_e; ++i)
+        for (int j = 0; j < n_out; ++j)
+          m.f32.push_back((float)id->energy_out_(i, j));
+      uint32_t moff = f32_off();
+      for (int i = 0; i < n_e; ++i)
+        for (int j = 0; j < n_out; ++j)
+          for (int k = 0; k < n_mu; ++k)
+            m.f32.push_back((float)id->mu_out_(i, j, k));
+      int32_t hdr = (int32_t)i32_off();
+      m.i32.push_back(GPU_TDIST_INCOH_INEL_DISC);
+      m.i32.push_back(n_e);
+      m.i32.push_back((int32_t)eoff);
+      m.i32.push_back(n_out);
+      m.i32.push_back(n_mu);
+      m.i32.push_back(id->skewed_ ? 1 : 0);
+      m.i32.push_back((int32_t)eooff);
+      m.i32.push_back((int32_t)moff);
+      return hdr;
+    }
+    if (auto* ic = dynamic_cast<const IncoherentInelasticAE*>(ae)) {
+      int n_e = (int)ic->energy_.size();
+      std::vector<int32_t> blobs(n_e);
+      for (int l = 0; l < n_e; ++l) {
+        const auto& d = ic->distribution_[l];
+        int n = (int)d.n_e_out;
+        int n_mu = (int)d.mu.shape(1);
+        uint32_t off = f32_off();
+        for (int j = 0; j < n; ++j)
+          m.f32.push_back((float)d.e_out(j));
+        for (int j = 0; j < n; ++j)
+          m.f32.push_back((float)d.e_out_pdf(j));
+        for (int j = 0; j < n; ++j)
+          m.f32.push_back((float)d.e_out_cdf(j));
+        for (int j = 0; j < n; ++j)
+          for (int k = 0; k < n_mu; ++k)
+            m.f32.push_back((float)d.mu(j, k));
+        int32_t b = (int32_t)i32_off();
+        m.i32.push_back(n);
+        m.i32.push_back(n_mu);
+        m.i32.push_back((int32_t)off);
+        blobs[l] = b;
+      }
+      int32_t hdr = (int32_t)i32_off();
+      m.i32.push_back(GPU_TDIST_INCOH_INEL_CONT);
+      m.i32.push_back(n_e);
+      m.i32.push_back((int32_t)push_fc(ic->energy_));
+      for (auto b : blobs)
+        m.i32.push_back(b);
+      return hdr;
+    }
+    if (auto* mx = dynamic_cast<const MixedElasticAE*>(ae)) {
+      int32_t coh = coherent_el_blob(mx->coherent_xs_);
+      int32_t incoh = sab_dist(mx->incoherent_dist_.get(), table_index);
+      if (incoh < 0)
+        return -1;
+      int32_t ixs = f1d(&mx->incoherent_xs_);
+      if (ixs < 0)
+        return -1;
+      int32_t hdr = (int32_t)i32_off();
+      m.i32.push_back(GPU_TDIST_MIXED_EL);
+      m.i32.push_back(coh);
+      m.i32.push_back(incoh);
+      m.i32.push_back(table_index);
+      m.i32.push_back(ixs);
+      return hdr;
+    }
+    err = "unsupported thermal scattering law";
+    return -1;
+  }
+
+  //! Flatten one thermal table (friend access to ThermalData internals)
+  bool sab_table(const ThermalScattering& ts, double model_kT,
+    GpuSabTable& gt, int table_index)
+  {
+    int i_temp = 0;
+    double best = 1e300;
+    for (size_t t = 0; t < ts.kTs_.size(); ++t) {
+      double d = std::abs(ts.kTs_[t] - model_kT);
+      if (d < best) {
+        best = d;
+        i_temp = (int)t;
+      }
+    }
+    const ThermalData& td = ts.data_[i_temp];
+    gt.awr = (float)ts.awr_;
+    gt.kT = (float)ts.kTs_[i_temp];
+    gt.energy_max = (float)ts.energy_max_;
+    gt.inelastic_xs_f1d = f1d(td.inelastic_.xs.get());
+    if (gt.inelastic_xs_f1d < 0) {
+      err = "inelastic xs form unsupported";
+      return false;
+    }
+    gt.inelastic_dist = sab_dist(td.inelastic_.distribution.get(),
+      table_index);
+    if (gt.inelastic_dist < 0)
+      return false;
+    gt.elastic_xs_type = GPU_SABXS_NONE;
+    gt.elastic_xs_blob = -1;
+    gt.elastic_dist = -1;
+    if (td.elastic_.xs) {
+      if (auto* cx =
+            dynamic_cast<const CoherentElasticXS*>(td.elastic_.xs.get())) {
+        size_t n = cx->bragg_edges().size();
+        uint32_t eoff = push_fc(cx->bragg_edges());
+        uint32_t foff = push_fc(cx->factors());
+        gt.elastic_xs_type = GPU_SABXS_COHERENT;
+        gt.elastic_xs_blob = (int32_t)i32_off();
+        m.i32.push_back((int32_t)n);
+        m.i32.push_back((int32_t)eoff);
+        m.i32.push_back((int32_t)foff);
+      } else if (auto* ix = dynamic_cast<const IncoherentElasticXS*>(
+                   td.elastic_.xs.get())) {
+        double d[2] = {ix->bound_xs_, ix->debye_waller_};
+        gt.elastic_xs_type = GPU_SABXS_INCOHERENT;
+        gt.elastic_xs_blob = (int32_t)push_f(d, 2);
+      } else {
+        int32_t f = f1d(td.elastic_.xs.get());
+        if (f < 0) {
+          err = "elastic xs form unsupported";
+          return false;
+        }
+        gt.elastic_xs_type = GPU_SABXS_TAB;
+        gt.elastic_xs_blob = f;
+      }
+      gt.elastic_dist = sab_dist(td.elastic_.distribution.get(), table_index);
+      if (gt.elastic_dist < 0)
+        return false;
+    }
+    return true;
   }
 
   // ---- AngleEnergy dispatch ----
@@ -560,16 +741,22 @@ bool flatten_ce(FlatModel& m)
     m.nuclides.push_back(gn);
   }
 
+  // S(a,b) thermal scattering tables
+  m.sab_tables.clear();
+  for (size_t it = 0; it < data::thermal_scatt.size(); ++it) {
+    const ThermalScattering& ts = *data::thermal_scatt[it];
+    GpuSabTable gt {};
+    if (!fx.sab_table(ts, model_kT, gt, (int)m.sab_tables.size()))
+      return reject_ce(
+        m, fmt::format("thermal table {}: {}", ts.name_, fx.err));
+    m.sab_tables.push_back(gt);
+  }
+
   // materials
   m.materials.clear();
   m.mgmats.clear();
   for (const auto& mp : model::materials) {
     const Material& mat = *mp;
-    if (!mat.thermal_tables_.empty())
-      return reject_ce(
-        m, fmt::format("material {} uses S(a,b) thermal scattering "
-                       "(unsupported in GPU v1 — see docs/metal_port)",
-             mat.id_));
     if (mat.nuclide_.size() > 32)
       return reject_ce(
         m, fmt::format("material {} has more than 32 nuclides", mat.id_));
@@ -584,6 +771,21 @@ bool flatten_ce(FlatModel& m)
     gm.fissionable = mat.fissionable() ? 1u : 0u;
     gm.mg_off = -1;
     gm.sab_off = -1;
+    gm.sab_frac_off = -1;
+    if (!mat.thermal_tables_.empty()) {
+      std::vector<int32_t> idx(mat.nuclide_.size(), -1);
+      std::vector<float> frac(mat.nuclide_.size(), 0.0f);
+      for (const auto& tt : mat.thermal_tables_) {
+        idx[tt.index_nuclide] = tt.index_table;
+        frac[tt.index_nuclide] = (float)tt.fraction;
+      }
+      gm.sab_off = (int32_t)fx.i32_off();
+      for (auto v : idx)
+        m.i32.push_back(v);
+      gm.sab_frac_off = (int32_t)fx.f32_off();
+      for (auto v : frac)
+        m.f32.push_back(v);
+    }
     m.materials.push_back(gm);
   }
   return true;

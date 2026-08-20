@@ -375,6 +375,7 @@ void try_initialize()
       !upload(OMG_SLOT_I32, eng.flat.i32) ||
       !upload(OMG_SLOT_F32, eng.flat.f32) ||
       !upload(OMG_SLOT_NUCLIDES, eng.flat.nuclides) ||
+      !upload(OMG_SLOT_SAB, eng.flat.sab_tables) ||
       !upload(OMG_SLOT_TALLIES, eng.flat.tallies) ||
       !upload(OMG_SLOT_FILTERS, eng.flat.filters) ||
       !upload(OMG_SLOT_MESHES, eng.flat.meshes)) {
@@ -624,8 +625,9 @@ void transport_generation()
       double g[4] = {};
       for (uint32_t i = 0; i < gm.n_nuclides; ++i) {
         int32_t in = eng.flat.i32[gm.nuclide_off + i];
-        GpuMicroXS mi =
-          gpu_ce_micro_xs(cev, eng.flat.nuclides[in], Ef, i_log, dummy_seeds);
+        GpuSabView no_sab {};
+        GpuMicroXS mi = gpu_ce_micro_xs(cev, eng.flat.nuclides[in], Ef,
+          i_log, -1, 0.0f, no_sab, dummy_seeds);
         float dens = eng.flat.f32[gm.density_off + i];
         g[0] += dens * mi.total;
         g[1] += dens * mi.absorption;
@@ -921,6 +923,10 @@ void transport_generation()
     cev.energy_min = ctl->energy_min;
     cev.energy_max = ctl->energy_max;
     cev.urr_on = ctl->urr_on;
+    GpuSabView sabv;
+    sabv.tables = eng.flat.sab_tables.data();
+    sabv.i32 = eng.flat.i32.data();
+    sabv.f32 = eng.flat.f32.data();
     GpuTallyView tvv {};
     tvv.n_tallies = 0;
     tvv.i32 = eng.flat.i32.data();
@@ -938,7 +944,7 @@ void transport_generation()
     hb.red_slots = host_red.data();
     hb.trace = host_trace.data();
     for (int64_t i = 0; i < n; ++i)
-      gpu_run_particle((uint32_gpu)i, *ctl, geom, mgv, cev, tvv, hb);
+      gpu_run_particle((uint32_gpu)i, *ctl, geom, mgv, cev, sabv, tvv, hb);
     std::fprintf(stderr,
       "[gpu-debug] host replay: lost=%u (init %u advance %u lattice %u "
       "reflect %u)\n",

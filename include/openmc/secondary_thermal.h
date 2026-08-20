@@ -44,6 +44,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   const CoherentElasticXS& xs_; //!< Coherent elastic scattering cross section
   tensor::Tensor<double> bragg_edges_; //!< Copy of Bragg edges for slicing
   tensor::Tensor<double>
@@ -79,6 +80,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   double debye_waller_;
 };
 
@@ -113,6 +115,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   const vector<double>& energy_;  //!< Energies at which cosines are tabulated
   tensor::Tensor<double> mu_out_; //!< Cosines for each incident energy
 };
@@ -154,6 +157,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   const vector<double>& energy_; //!< Incident energies
   tensor::Tensor<double>
     energy_out_; //!< Outgoing energies for each incident energy
@@ -201,6 +205,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   //! Secondary energy/angle distribution
   struct DistEnergySab {
     std::size_t n_e_out;              //!< Number of outgoing energies
@@ -251,6 +256,7 @@ public:
     double E_in, double mu, double& E_out, uint64_t* seed) const override;
 
 private:
+  friend struct GpuCeFlatten;
   CoherentElasticAE coherent_dist_;         //!< Coherent distribution
   unique_ptr<AngleEnergy> incoherent_dist_; //!< Incoherent distribution
 

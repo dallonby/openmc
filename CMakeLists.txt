@@ -516,6 +516,8 @@ if(OPENMC_USE_METAL)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/portable_math.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/geometry.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/mg.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/f1d.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/sab.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/ce.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/transport.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/device/metal_main.h)

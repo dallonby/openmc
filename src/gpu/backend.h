@@ -33,7 +33,8 @@ enum OmgSlot {
   OMG_SLOT_TACCUM = 17,
   OMG_SLOT_NUCLIDES = 18,
   OMG_SLOT_TRACE = 19,
-  OMG_SLOT_COUNT = 20
+  OMG_SLOT_SAB = 20,
+  OMG_SLOT_COUNT = 21
 };
 
 extern "C" {

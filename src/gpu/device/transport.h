@@ -205,7 +205,8 @@ DEVICE_FN float gpu_ce_nu_delayed(GpuCeView ce, GpuNuclide nuc, float E)
 
 //! Full history for one source particle. Mirrors the CPU event loop.
 DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
-  GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuTallyView tv, GpuBanks banks)
+  GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuSabView sab,
+  GpuTallyView tv, GpuBanks banks)
 {
   // ---- initialize_history ----
   GpuSourceSite src = banks.source[ctl.source_offset + tid];
@@ -255,6 +256,19 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   bool found =
     gpu_exhaustive_find_cell(geom, &gs, ctl.root_universe, ctl.n_coord_levels);
   if (!found) {
+    // fp32 source positions can sit epsilon-outside at boundaries; try a
+    // nudge along the flight direction, then against it (sites born at a
+    // wall with outward-pointing directions need the latter)
+    gpu_move_distance(&gs, GPU_TINY_BIT);
+    found = gpu_exhaustive_find_cell(
+      geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+    if (!found) {
+      gpu_move_distance(&gs, -2.0f * GPU_TINY_BIT);
+      found = gpu_exhaustive_find_cell(
+        geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+    }
+  }
+  if (!found) {
     gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
     gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_INIT, 1u);
     wgt = 0.0f;
@@ -284,7 +298,18 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             i_log = (int32_gpu)ce.n_log_bins - 1;
           for (uint32_gpu i = 0; i < mat.n_nuclides; ++i) {
             int32_gpu in = geom.i32[mat.nuclide_off + i];
-            micros[i] = gpu_ce_micro_xs(ce, ce.nuclides[in], E, i_log, seeds);
+            int32_gpu i_sab =
+              (mat.sab_off >= 0) ? geom.i32[mat.sab_off + i] : -1;
+            float sfrac = 0.0f;
+            if (i_sab >= 0) {
+              // material.cpp:854: the table only applies below its cutoff
+              if (E > sab.tables[i_sab].energy_max)
+                i_sab = -1;
+              else
+                sfrac = geom.f32[mat.sab_frac_off + i];
+            }
+            micros[i] = gpu_ce_micro_xs(
+              ce, ce.nuclides[in], E, i_log, i_sab, sfrac, sab, seeds);
             float dens = geom.f32[mat.density_off + i] * gs.density_mult;
             xs.total += dens * micros[i].total;
             xs.absorption += dens * micros[i].absorption;
@@ -309,10 +334,24 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                        : -logf(gpu_prn(&seeds[stream])) / xs.total;
       float distance = fminf(gs.boundary.d, d_coll);
       if (distance >= GPU_INFTY) {
-        gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
-        gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_ADVANCE, 1u);
-        wgt = 0.0f;
-        break;
+        // grazing tangency can hide every surface in fp32: nudge and
+        // re-resolve (bounded by the event cap)
+        gs.surface = GPU_SURFACE_NONE;
+        gpu_move_distance(&gs, GPU_TINY_BIT);
+        if (!gpu_exhaustive_find_cell(
+              geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
+          gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+          gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_ADVANCE, 1u);
+          wgt = 0.0f;
+          break;
+        }
+        ++n_events;
+        if (n_events >= ctl.max_events) {
+          gpu_atomic_add_u32(banks.counters + GPU_CTR_MAX_EVENT_HIT, 1u);
+          wgt = 0.0f;
+          break;
+        }
+        continue;
       }
 #ifdef GPU_HOST_DEBUG
       gpu_host_stat_flight(distance);
@@ -409,13 +448,21 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             gs.n_coord = 1;
             if (!gpu_exhaustive_find_cell(
                   geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
+              // corner reflection can land epsilon-outside: nudge along
+              // the reflected (inward) direction and retry
+              gs.surface = GPU_SURFACE_NONE;
+              gpu_move_distance(&gs, GPU_TINY_BIT);
+              if (!gpu_exhaustive_find_cell(
+                    geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
 #ifdef GPU_HOST_DEBUG
-              gpu_host_debug_lost(&gs, tok, r0, u0, u_new);
+                gpu_host_debug_lost(&gs, tok, r0, u0, u_new);
 #endif
-              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
-              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_REFLECT, 1u);
-              wgt = 0.0f;
-              break;
+                gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+                gpu_atomic_add_u32(
+                  banks.counters + GPU_CTR_LOST_REFLECT, 1u);
+                wgt = 0.0f;
+                break;
+              }
             }
           } else {
             // transmission: search from the crossing level down
@@ -606,7 +653,26 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             float cut =
               gpu_prn(&seeds[stream]) * (mic->total - mic->absorption);
             float el = gpu_ce_elastic_xs(ce, nuc, mic);
-            if (el > cut) {
+            if (mic->i_sab >= 0 && el - mic->thermal <= cut && el > cut) {
+              // S(a,b) scatter (physics.cpp sab_scatter +
+              // ThermalData::sample_dist)
+              GpuSabTable t = sab.tables[mic->i_sab];
+              int32_gpu tblob =
+                (gpu_prn(&seeds[stream]) <
+                  mic->thermal_elastic / mic->thermal)
+                  ? t.elastic_dist
+                  : t.inelastic_dist;
+              GpuSampleEA r =
+                gpu_sab_sample_dist(sab, tblob, E, &seeds[stream]);
+              float mu = r.mu;
+              if (mu > 1.0f)
+                mu = 1.0f;
+              if (mu < -1.0f)
+                mu = -1.0f;
+              E = r.E_out;
+              gs.coord[0].u =
+                gpu_rotate_angle(gs.coord[0].u, mu, &seeds[stream]);
+            } else if (el - mic->thermal > cut) {
               // elastic with free-gas target motion (physics.cpp:788)
               float vel = sqrtf(E);
               GpuVec3 u0 = gs.coord[0].u;

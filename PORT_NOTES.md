@@ -11,10 +11,19 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    branch in `src/mgxs.cpp`). The `gout == nullptr` branches indexed the
    rank-3 `delayed_nu_fission` tensor `[angle][dg][gin]` with four indices
    and iterated `shape(3)` of a rank-3 tensor; the sums are over outgoing
-   groups so they must read `chi_delayed` `[angle][dg][gin][gout]`. The
-   branch was unreachable from current callers (the only caller passes a
-   non-null `gout`), so it never produced wrong physics upstream — but any
-   new caller would have hit it. Candidate for an upstream PR.
+   groups so they must read `chi_delayed` `[angle][dg][gin][gout]`.
+   Failure mode: `tensor::Tensor::operator()` has no rank check
+   (`include/openmc/tensor.h:568`), so the four-index read walks past the
+   stride vector, and `delayed_nu_fission.shape(3)` returns 0, which makes
+   the dg==nullptr branch silently return 0. The branch is unreachable
+   from current callers (the only external CHI_* caller,
+   `src/random_ray/flat_source_domain.cpp:1208`, passes a non-null
+   `gout`), so it never produced wrong physics upstream — but any new
+   caller would have hit it. The rank-4-vs-comment mismatch in
+   `include/openmc/xsdata.h` (which documented chi_delayed as
+   `[angle][in][out][dg]`) is fixed on this branch too. Candidate for an
+   upstream PR; the missing rank check in `tensor::Tensor::operator()` is
+   a second hardening candidate.
 
 2. **`Nuclide::reaction_index_` narrows `SIZE_MAX` to `int`**
    (`nuclide.cpp` fills the `array<size_t, 902>` with `C_NONE` (=-1, i.e.

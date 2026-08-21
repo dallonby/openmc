@@ -1,15 +1,115 @@
-# OpenMC + Apple Metal GPU
+# OpenMC on Apple Silicon GPUs
 
-> **This repository is OpenMC with a GPU transport engine for Apple
-> Silicon** (Metal compute kernels, FP32-first, drop-in compatible,
-> structured for NVIDIA/CUDA extension). Enable it with
-> `model.settings.gpu = True` or `OPENMC_GPU=1`. Start with
-> **[README_METAL.md](README_METAL.md)** for build, usage, the supported
-> envelope, validation, and benchmarks, and
-> **[PORT_NOTES.md](PORT_NOTES.md)** for the engineering evidence and open
-> items. Everything else below is upstream OpenMC, unchanged; upstream
-> development lives at
-> [openmc-dev/openmc](https://github.com/openmc-dev/openmc).
+**The first port of the [OpenMC](https://github.com/openmc-dev/openmc)
+Monte Carlo particle transport code to Apple GPUs.** Real continuous-energy
+nuclear data, the real OpenMC code base, one line to enable — and up to
+**26× the throughput of the same machine's best-tuned CPU run**.
+
+```python
+import openmc
+
+model = openmc.examples.pwr_pin_cell()   # any normal OpenMC model
+model.settings.gpu = True                # <-- the only change
+model.run()
+```
+
+No new input format, no separate toolchain, no offline shader compiler.
+The same `openmc` executable, Python API, XML inputs, and statepoint files
+— transport runs on the GPU when the model is inside the engine's
+envelope, and falls back to the CPU with a clear warning when it is not.
+
+## Performance
+
+Measured on an M3 Ultra (80-core GPU) against **the same machine's best
+CPU configuration** — every baseline uses its measured-best thread count,
+because on many-core Apple Silicon the CPU tally path scales *negatively*
+past ~8 threads and an all-cores baseline would flatter the GPU:
+
+| Case | GPU | Best CPU (native arm64) | Speedup |
+|---|---|---|---|
+| CE Godiva (fast benchmark), 1M/batch | **10.8M histories/s** | 1.70M/s (4t) | **6.4×** |
+| CE Godiva, no tallies | **16.8M histories/s** | — | — |
+| CE PWR pincell with S(α,β) thermal scattering | **0.60M histories/s** | 70k/s (4t) | **8.6×** |
+| 7-group MG pin lattice, 1M/batch | **3.9M histories/s** | 149k/s (8t) | **26×** |
+
+Against an x86_64 build under Rosetta 2 — the number that matters if you
+are migrating an Intel-era workflow — the same runs are **8–34× faster**.
+The GPU gets faster as batches get bigger (it is under-occupied below
+~10⁵ particles in flight); 400 million Godiva histories take 25 seconds.
+
+## Accuracy
+
+Speed is easy if you don't check the answer. This port checks the answer:
+
+- **k-effective agrees with fp64 CPU OpenMC to −3.8 ± 4.7 pcm** on a
+  400M-history Godiva run — any residual fp32-vs-fp64 bias is bounded to
+  **[−13, +6] pcm at 95% confidence**, an order of magnitude below
+  nuclear-data uncertainty. Both engines also land on the ICSBEP
+  experimental value.
+- Every validation case (MG lattice, CE pincell with and without S(α,β),
+  Godiva) agrees with the CPU reference **within 1σ**, tally suites
+  included.
+- The Metal engine reproduces the host-compiled build of the same source
+  **bit-for-bit** over 2 million paired histories — the device computes
+  exactly what the code says.
+- Random-number streams are **bit-exact** with upstream's PCG generator,
+  including skip-ahead seeding and URR stream discipline, so fission
+  banks are reproducible, not just statistically equivalent.
+- Zero lost particles on the MG lattice and Godiva suites; upstream's
+  standard lost-particle accounting and abort thresholds are enforced.
+
+The engineering behind those numbers is documented in
+[PORT_NOTES.md](PORT_NOTES.md) — including the war story of a −630 pcm
+bias root-caused by ablation to the Metal compiler silently miscompiling
+(formally illegal) device recursion, and the fp32 geometry redesign that
+took lost-particle rates from ~5×10⁻⁵ to zero on the lattice suites.
+Two independent AI code reviews were run against the CPU sources and
+every verified finding fixed; the audit trail is in the same file.
+
+## Built to extend: CUDA-ready by construction
+
+The device code is a **single source** written in a small portable
+dialect ([src/gpu/device/](src/gpu/device/)) that compiles three ways
+today:
+
+1. **Metal** — MSL generated and compiled at runtime; no `xcrun metal`,
+   no offline toolchain, works from a stock Xcode CLT install.
+2. **Host C++** — a bit-identical "replay" engine used for validation and
+   forensics (the reason the compiler bug above was findable at all).
+3. **CUDA-ready** — the dialect shims (`GLOBAL`/`THREAD`, atomics,
+   typedefs) and the backend ABI ([src/gpu/backend.h](src/gpu/backend.h))
+   are the complete integration surface: an NVIDIA port is one
+   `backend_cuda.cu` implementing the same buffer slots, not a rewrite.
+
+Determinism is part of the design: transcendentals are bit-portable
+polynomial kernels (no vendor libm, no FMA contraction), so Metal, host,
+and future CUDA builds compute identical bits — vendor ulp differences
+were measured to bias Monte Carlo ensembles at 11σ before this layer
+existed.
+
+**Physics envelope**: full continuous-energy neutron transport
+(ENDF/B-VIII.0 pointwise data, URR probability tables, S(α,β) thermal
+scattering, partial fission with delayed neutrons, all secondary angle–
+energy laws, free-gas scattering, (n,xn)) plus multigroup mode; CSG
+geometry with lattices, reflective/white/vacuum BCs; tracklength and
+collision tallies. Anything outside the envelope is detected at startup
+and runs on the CPU unchanged. Details: [README_METAL.md](README_METAL.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [README_METAL.md](README_METAL.md) | Build, usage, envelope, validation, benchmarks |
+| [PORT_NOTES.md](PORT_NOTES.md) | Engineering notes: fp32 design decisions with evidence, upstream findings, review audit trail |
+| [tools/metal-validation/](tools/metal-validation/) | The validation models and comparison tooling |
+| [openmc-dev/openmc#4067](https://github.com/openmc-dev/openmc/pull/4067) | First upstream bugfix contributed from this work |
+
+This repository tracks upstream OpenMC (`develop`); the fork branch for
+upstream PRs lives at
+[dallonby/openmc](https://github.com/dallonby/openmc). Everything below
+is the upstream OpenMC README, unchanged.
+
+---
 
 # OpenMC Monte Carlo Particle Transport Code
 

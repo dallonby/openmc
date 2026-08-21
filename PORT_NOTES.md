@@ -206,15 +206,24 @@ distribution dispatcher now does too.
 
 ## Open items
 
-1. Fixed-source mode, MPI, photon transport, DAGMC, hex lattices, tori,
+1. Fixed-source mode is supported for non-multiplying models (the
+   external source is host-sampled per particle in fp64 with the upstream
+   STREAM_SOURCE seed discipline; the device fission blocks are gated by
+   run mode, and the fission-bank/progeny copy-back is eigenvalue-only).
+   A deep-penetration acceptance model — the PROCESS-audit CP-shield slab
+   (60 cm W / WC+H2O / W2B5 / W2B5+H2O, 14.06 MeV planar source, 60 x
+   1 cm depth-cell flux profiles) — lives in
+   `tools/metal-validation/cp_shield.py`.
+2. Fixed-source with fissionable materials, MPI, photon transport, DAGMC,
+   hex lattices, tori,
    periodic BCs, survival biasing, weight windows, multi-temperature
    models, temperature interpolation, resonance upscattering (DBRC/RVS),
    NCrystal, isotropic-in-lab (p0) scattering, neutron time cutoffs,
    mesh tally filters, distribcell — all detected and fall back to CPU
    with a warning.
-2. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
+3. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
    the table for CE); unionized/material-major energy grids.
-3. CUDA backend: the dialect and backend ABI are in place
+4. CUDA backend: the dialect and backend ABI are in place
    (`src/gpu/device/dialect.h`, `src/gpu/backend.h`); needs
    `backend_cuda.cu` implementing the same slots and a kernel wrapper, plus
    `-ffp-contract=off`/`--fmad=false` for bit parity with the portable

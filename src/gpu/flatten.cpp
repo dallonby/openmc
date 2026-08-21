@@ -645,6 +645,16 @@ bool flatten_model(FlatModel& m)
     if (!flatten_mg(m))
       return false;
   }
+  if (settings::run_mode == RunMode::FIXED_SOURCE) {
+    // Non-multiplying fixed source only: with fissionable material,
+    // fixed-source mode banks fission neutrons into the CPU's secondary
+    // bank (subcritical multiplication), which the device does not model
+    for (const auto& mat : m.materials)
+      if (mat.fissionable)
+        return reject(
+          m, "fixed-source with fissionable materials (subcritical "
+             "multiplication) is not in the GPU envelope");
+  }
   if (!flatten_tallies(m))
     return false;
   return true;

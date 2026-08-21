@@ -44,6 +44,7 @@ extern uint64_t prn_stride;
 } // namespace openmc
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
+#include "openmc/source.h"
 #include "openmc/tallies/tally.h"
 
 #include "backend.h"
@@ -341,8 +342,9 @@ void try_initialize()
     return;
   }
 #endif
-  if (settings::run_mode != RunMode::EIGENVALUE) {
-    fail("only eigenvalue runs are in the GPU v1 envelope");
+  if (settings::run_mode != RunMode::EIGENVALUE &&
+      settings::run_mode != RunMode::FIXED_SOURCE) {
+    fail("only eigenvalue and fixed-source runs are in the GPU envelope");
     return;
   }
   if (simulation::work_per_rank > 0x7fffffffLL) {
@@ -439,7 +441,9 @@ void transport_generation()
   std::memset(ctl, 0, sizeof(GpuControl));
   ctl->n_particles = (uint32_t)n;
   ctl->source_offset = 0;
-  ctl->run_mode = GPU_RUN_EIGENVALUE;
+  ctl->run_mode = (settings::run_mode == RunMode::FIXED_SOURCE)
+                    ? GPU_RUN_FIXED_SOURCE
+                    : GPU_RUN_EIGENVALUE;
   ctl->energy_mode = settings::run_CE ? GPU_MODE_CE : GPU_MODE_MG;
   ctl->keff = (float)simulation::keff;
   if (!settings::run_CE)
@@ -482,8 +486,7 @@ void transport_generation()
   auto* src =
     static_cast<GpuSourceSite*>(omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
   double src_weight = 0.0;
-  for (int64_t i = 0; i < n; ++i) {
-    const SourceSite& s = simulation::source_bank[i];
+  auto upload_site = [src](int64_t i, const SourceSite& s) {
     GpuSourceSite& g = src[i];
     g.r[0] = (float)s.r.x;
     g.r[1] = (float)s.r.y;
@@ -497,7 +500,26 @@ void transport_generation()
     g.delayed_group = s.delayed_group;
     g.parent_id = 0;
     g.progeny_id = 0;
-    src_weight += s.wgt;
+  };
+  if (settings::run_mode == RunMode::FIXED_SOURCE) {
+    // CPU fixed-source samples the external source on the fly per history
+    // (initialize_history): host-sample here with the identical fp64
+    // upstream code and per-particle STREAM_SOURCE seed discipline, then
+    // upload the fp32 sites
+#pragma omp parallel for reduction(+ : src_weight)
+    for (int64_t i = 0; i < n; ++i) {
+      int64_t id = compute_transport_seed(compute_particle_id(i + 1));
+      uint64_t seed = init_seed(id, STREAM_SOURCE);
+      SourceSite s = sample_external_source(&seed);
+      upload_site(i, s);
+      src_weight += s.wgt;
+    }
+  } else {
+    for (int64_t i = 0; i < n; ++i) {
+      const SourceSite& s = simulation::source_bank[i];
+      upload_site(i, s);
+      src_weight += s.wgt;
+    }
   }
   simulation::total_weight += src_weight;
 
@@ -1052,29 +1074,34 @@ void transport_generation()
       ctr[GPU_CTR_MAX_EVENT_HIT]));
   }
 
-  // ---- fission bank + progeny bookkeeping (feeds upstream sort/sync) ----
-  auto* fb =
-    static_cast<GpuSourceSite*>(omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
-  simulation::fission_bank.resize(n_sites);
-  for (uint32_t i = 0; i < n_sites; ++i) {
-    const GpuSourceSite& g = fb[i];
-    SourceSite s;
-    s.r = {g.r[0], g.r[1], g.r[2]};
-    s.u = {g.u[0], g.u[1], g.u[2]};
-    s.E = g.E;
-    s.time = g.time;
-    s.wgt = g.wgt;
-    s.delayed_group = g.delayed_group;
-    s.surf_id = 0;
-    s.particle = ParticleType::neutron();
-    s.parent_id = g.parent_id;
-    s.progeny_id = g.progeny_id;
-    simulation::fission_bank[i] = s;
+  // ---- fission bank + progeny bookkeeping (feeds upstream sort/sync;
+  // eigenvalue only — fixed-source models are non-multiplying here) ----
+  if (settings::run_mode == RunMode::EIGENVALUE) {
+    auto* fb = static_cast<GpuSourceSite*>(
+      omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
+    simulation::fission_bank.resize(n_sites);
+    for (uint32_t i = 0; i < n_sites; ++i) {
+      const GpuSourceSite& g = fb[i];
+      SourceSite s;
+      s.r = {g.r[0], g.r[1], g.r[2]};
+      s.u = {g.u[0], g.u[1], g.u[2]};
+      s.E = g.E;
+      s.time = g.time;
+      s.wgt = g.wgt;
+      s.delayed_group = g.delayed_group;
+      s.surf_id = 0;
+      s.particle = ParticleType::neutron();
+      s.parent_id = g.parent_id;
+      s.progeny_id = g.progeny_id;
+      simulation::fission_bank[i] = s;
+    }
+    auto* prog =
+      static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_PROGENY));
+    for (int64_t i = 0; i < n; ++i)
+      simulation::progeny_per_particle[i] = prog[i] & 0x7fffffffu;
   }
   auto* prog =
     static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_PROGENY));
-  for (int64_t i = 0; i < n; ++i)
-    simulation::progeny_per_particle[i] = prog[i] & 0x7fffffffu;
   if (const char* lm = std::getenv("OPENMC_LEAK_MAP")) {
     std::string path = std::string(lm) + ".dev";
     FILE* f = std::fopen(path.c_str(), "wb");

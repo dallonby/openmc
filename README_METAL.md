@@ -88,7 +88,7 @@ run proceeds normally on the CPU.
 
 | Supported | Falls back to CPU |
 |---|---|
-| k-eigenvalue runs | fixed-source, photon transport, MPI |
+| k-eigenvalue runs; fixed-source runs in non-multiplying models (the external source is host-sampled in fp64 with the upstream per-particle seed discipline) | fixed-source with fissionable materials (subcritical multiplication), photon transport, MPI |
 | Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic (`free_gas_threshold` honored), S(a,b) thermal scattering (coherent/incoherent elastic, continuous + discrete inelastic), level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission, energy cutoff | windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models, temperature interpolation, NCrystal, isotropic-in-lab (p0) scattering, time cutoffs |
 | Multigroup: macroscopic isotropic MGXS, tabular/histogram scattering laws, prompt + delayed fission | angle-dependent MGXS, Legendre sampling (use the default `tabular_legendre` conversion) |
 | CSG: all quadric surface types, universes, rectangular lattices, translations/rotations, vacuum/reflective/white BCs | tori, hex lattices, periodic BCs, boundary albedo, DAGMC, distribcell/multi-instance materials |

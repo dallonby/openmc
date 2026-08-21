@@ -1,3 +1,16 @@
+# OpenMC + Apple Metal GPU
+
+> **This repository is OpenMC with a GPU transport engine for Apple
+> Silicon** (Metal compute kernels, FP32-first, drop-in compatible,
+> structured for NVIDIA/CUDA extension). Enable it with
+> `model.settings.gpu = True` or `OPENMC_GPU=1`. Start with
+> **[README_METAL.md](README_METAL.md)** for build, usage, the supported
+> envelope, validation, and benchmarks, and
+> **[PORT_NOTES.md](PORT_NOTES.md)** for the engineering evidence and open
+> items. Everything else below is upstream OpenMC, unchanged; upstream
+> development lives at
+> [openmc-dev/openmc](https://github.com/openmc-dev/openmc).
+
 # OpenMC Monte Carlo Particle Transport Code
 
 [![License](https://img.shields.io/badge/license-MIT-green)](https://docs.openmc.org/en/latest/license.html)

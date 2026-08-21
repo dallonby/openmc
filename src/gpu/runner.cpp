@@ -243,6 +243,7 @@ struct Engine {
   double gpu_seconds = 0.0;
   int64_t lost_total = 0;
   uint32_t n_red_slots = 0;
+  uint32_t tally_replicas = 1;
 };
 
 Engine eng;
@@ -402,6 +403,13 @@ void try_initialize()
   // dynamic buffers
   int64_t n = simulation::work_per_rank;
   eng.n_red_slots = (uint32_t)((n + 255) / 256);
+  // replicated tally banks: enough that per-bank per-batch sums stay far
+  // from the fp32 integer boundary (2^24), capped at 128 MB of banks
+  eng.tally_replicas = 64;
+  while (eng.tally_replicas > 1 &&
+         (size_t)eng.flat.tally_accum_size * eng.tally_replicas * 4 >
+           (size_t)128 << 20)
+    eng.tally_replicas >>= 1;
   int64_t bank_cap = 3 * n;
   if (omg_metal_buffer(eng.ctx, OMG_SLOT_CONTROL, sizeof(GpuControl)) ||
       omg_metal_buffer(
@@ -414,7 +422,8 @@ void try_initialize()
       omg_metal_buffer(eng.ctx, OMG_SLOT_REDSLOTS,
         (size_t)eng.n_red_slots * GPU_RED_WIDTH * 4) ||
       omg_metal_buffer(eng.ctx, OMG_SLOT_TACCUM,
-        std::max<size_t>(1, eng.flat.tally_accum_size) * 4) ||
+        std::max<size_t>(1, eng.flat.tally_accum_size) *
+          (size_t)eng.tally_replicas * 4) ||
       omg_metal_buffer(
         eng.ctx, OMG_SLOT_TRACE, GPU_TRACE_MAX * sizeof(GpuTraceRec))) {
     fail("device bank allocation failed");
@@ -472,6 +481,8 @@ void transport_generation()
   ctl->mg_default_iv_off = eng.flat.mg_default_iv_off;
   ctl->energy_cutoff = (float)settings::energy_cutoff[0];
   ctl->free_gas_threshold = (float)settings::free_gas_threshold;
+  ctl->tally_accum_stride = eng.flat.tally_accum_size;
+  ctl->tally_replicas = eng.tally_replicas;
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -531,7 +542,7 @@ void transport_generation()
     (size_t)eng.n_red_slots * GPU_RED_WIDTH * 4);
   if (eng.flat.tally_accum_size > 0)
     std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_TACCUM), 0,
-      (size_t)eng.flat.tally_accum_size * 4);
+      (size_t)eng.flat.tally_accum_size * eng.tally_replicas * 4);
 
   // ---- device math-function bias probe ----
   if (std::getenv("OPENMC_GPU_MATHPROBE")) {
@@ -1139,8 +1150,11 @@ void transport_generation()
         continue;
       for (uint32_t b = 0; b < td.n_filter_bins; ++b) {
         for (uint32_t s = 0; s < td.n_scores; ++s) {
-          results[(b * td.n_scores + s) * 3 + 0] +=
-            acc[td.accum_off + b * td.n_scores + s];
+          double v = 0.0;
+          for (uint32_t k = 0; k < eng.tally_replicas; ++k)
+            v += acc[(size_t)k * eng.flat.tally_accum_size + td.accum_off +
+                     b * td.n_scores + s];
+          results[(b * td.n_scores + s) * 3 + 0] += v;
         }
       }
     }

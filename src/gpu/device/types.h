@@ -252,6 +252,14 @@ struct GpuControl {
   float energy_cutoff;     // CE: kill neutrons below this after a collision
   float free_gas_threshold;     // settings::free_gas_threshold (in kT units)
   uint32_gpu mg_default_iv_off; // f32 arena: default inverse velocity [G]
+  // Tally accumulation uses tally_replicas independent fp32 banks (thread
+  // tid scores into bank tid % tally_replicas; the host sums banks in
+  // fp64). A single fp32 bank saturates on large batches: once a bin's
+  // per-batch sum nears 2^24, sub-ulp track contributions round away and
+  // the tally biases low (measured: -1.3% on a 4e6-particle-batch
+  // deep-penetration front bin, -0.07% at 1e6).
+  uint32_gpu tally_accum_stride; // floats per bank (= tally_accum_size)
+  uint32_gpu tally_replicas;    // number of banks (power of two)
 };
 
 // device trace record (debug)

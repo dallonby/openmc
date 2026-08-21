@@ -354,6 +354,51 @@ reduction, optional wavefront pipeline for collision-heavy CE, compiled
 metallib caching keyed on source hash, a host-side arena validator, and
 full-width RNG-state traces.
 
+## Deep-penetration acceptance (2026-08-21, fixed-source mode)
+
+The fixed-source envelope was accepted against the regime the reactor
+suite does not probe: the PROCESS-audit CP-shield slab
+(`tools/metal-validation/cp_shield.py`) — a 14.06 MeV isotropic planar
+source into 0.60 m of shield, 60 x 1 cm depth-cell flux profiles
+(total and E > 0.1 MeV), four materials spanning fast attenuations of
+6x10^3 (W) to 1.5x10^5 (W2B5), analog transport, independent seeds.
+
+Metal-CPU vs metal-GPU, 60 bins x 2 scores x 4 materials (GPU 4e8
+histories/material, CPU 1e8):
+
+| Material | total flux | E > 0.1 MeV flux |
+|---|---|---|
+| W | mean z² 1.46, max\|z\| 2.7 | 1.15 / 2.7 |
+| WC+13%H2O | 0.92 / 2.4 | 0.96 / 2.6 |
+| W2B5 | 0.60 / 1.6 | 0.73 / 1.8 |
+| W2B5+13%H2O | 1.39 / 3.2 | 1.47 / 3.7 |
+
+Every profile is statistics-consistent to the deepest bin; the
+W2B5/WC+H2O fast-flux ratios (the quantity PROCESS's CP refit consumes)
+agree between engines to 0.5% at 30 cm and ~1% at 55 cm. A same-model
+version bridge (the audit's archived 0.15.3 model run byte-identical on
+this tree's CPU) reproduces the 0.15.3 results to ratio 1.000 — no
+version skew.
+
+**fp32 finding the acceptance test caught: tally-accumulator
+saturation.** Per-batch tally bins accumulate in fp32 device atomics;
+once a bin's batch sum nears 2^24, sub-ulp track contributions round
+away and the tally biases LOW — measured -1.3% on the slab's front bin
+at 4x10^6 particles/batch (-0.07% at 1x10^6; invisible in the
+eigenvalue suite's smaller per-bin sums). Fixed structurally, not by
+capping batch sizes: tally accumulation now uses 64 replicated banks
+(thread tid scores into bank tid % 64; the host sums banks in fp64),
+which keeps per-bank sums ~64x below the hazard and reduces tally-atomic
+contention. The failing configuration reads 1.0002 +/- 0.0002 after the
+fix, and the eigenvalue suite is bit-unchanged.
+
+Reference-data note: the audit's archived 0.15.3 depth profiles were run
+with photon transport on and tallies that carry NO particle filter (the
+current audit script adds one; the archived models predate it), so those
+profiles include the secondary-gamma population — +20% at the face and
+up to +40% deep. The clean neutron-only profiles from this acceptance
+run supersede them for neutron-flux ratio work.
+
 ## Debug tooling (env-gated, zero cost when unset)
 
 | Variable | Effect |

@@ -68,7 +68,10 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   tv.meshes = meshes;
   tv.i32 = i32_arena;
   tv.f32 = f32_arena;
-  tv.accum = tally_accum;
+  // replicated accumulator banks: keeps per-bank fp32 sums small enough
+  // that individual track contributions never round away (see GpuControl)
+  tv.accum =
+    tally_accum + (tid % ctl.tally_replicas) * ctl.tally_accum_stride;
   tv.n_tallies = ctl.n_tallies;
 
   GpuBanks banks;

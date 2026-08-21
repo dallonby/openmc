@@ -106,6 +106,7 @@ run proceeds normally on the CPU.
 | CE Godiva bare HEU sphere (1M active) | 1.00125 ± 0.00059 | 1.00138 ± 0.00071 | 0.1σ; 0 lost particles |
 | CE Godiva bare HEU sphere (11M active) | 1.00041 ± 0.00022 | 1.00017 ± 0.00021 | 0.8σ (Δ = −24 pcm); leakage fraction agrees to 0.9σ |
 | CE Godiva bare HEU sphere (400M active) | 1.000051 ± 0.000032 | 1.000013 ± 0.000035 | **Δ = −3.8 ± 4.7 pcm** — any residual fp32-vs-fp64 bias is within [−13, +6] pcm at 95%; leakage fraction identical (0.57310) |
+| Fixed-source deep-penetration slab (0.6 m W / WC+H₂O / W₂B₅ / W₂B₅+H₂O, 14.06 MeV, fast attenuation up to 1.5×10⁵) | 60-bin depth profiles | 60-bin depth profiles | every bin within statistics (mean z² 0.6–1.5 over 480 bins); material flux ratios agree to ~0.5–1% |
 
 Lost particles are counted into the standard `n_lost_particles`
 accounting and the upstream abort thresholds apply (raise

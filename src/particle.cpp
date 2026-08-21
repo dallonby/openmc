@@ -1,5 +1,7 @@
 #include "openmc/particle.h"
 
+#include "openmc/openmp_interface.h"
+
 #include <algorithm> // copy, min
 #include <cmath>     // log, abs
 
@@ -575,6 +577,42 @@ void Particle::event_check_limit_and_revive()
   }
 }
 
+namespace {
+struct alignas(64) ThreadAccumulator {
+  double absorption = 0.0;
+  double collision = 0.0;
+  double tracklength = 0.0;
+  double leakage = 0.0;
+  double weight = 0.0;
+};
+std::vector<ThreadAccumulator>& thread_accumulators()
+{
+  static std::vector<ThreadAccumulator> acc(num_threads());
+  return acc;
+}
+ThreadAccumulator& thread_accumulator()
+{
+  return thread_accumulators()[thread_num()];
+}
+} // namespace
+
+void thread_accumulate_source_weight(double w)
+{
+  thread_accumulator().weight += w;
+}
+
+void flush_thread_accumulators()
+{
+  for (auto& a : thread_accumulators()) {
+    global_tally_absorption += a.absorption;
+    global_tally_collision += a.collision;
+    global_tally_tracklength += a.tracklength;
+    global_tally_leakage += a.leakage;
+    simulation::total_weight += a.weight;
+    a = ThreadAccumulator {};
+  }
+}
+
 void Particle::event_death()
 {
 #ifdef OPENMC_DAGMC_ENABLED
@@ -593,23 +631,18 @@ void Particle::event_death()
   const auto k_tracklength = keff_tally_tracklength();
   const auto leakage = keff_tally_leakage();
 
-  if (settings::run_mode == RunMode::EIGENVALUE) {
-    if (k_absorption != 0.0) {
-#pragma omp atomic
-      global_tally_absorption += k_absorption;
+  // Accumulate into this thread's padded slot; flushed once per generation
+  // (flush_thread_accumulators). Per-particle atomics on these shared
+  // doubles serialize every history across all threads — on a two-die Apple
+  // M3 Ultra that costs a 4x throughput collapse between 8 and 28 threads.
+  {
+    auto& acc = thread_accumulator();
+    if (settings::run_mode == RunMode::EIGENVALUE) {
+      acc.absorption += k_absorption;
+      acc.collision += k_collision;
+      acc.tracklength += k_tracklength;
     }
-    if (k_collision != 0.0) {
-#pragma omp atomic
-      global_tally_collision += k_collision;
-    }
-    if (k_tracklength != 0.0) {
-#pragma omp atomic
-      global_tally_tracklength += k_tracklength;
-    }
-  }
-  if (leakage != 0.0) {
-#pragma omp atomic
-    global_tally_leakage += leakage;
+    acc.leakage += leakage;
   }
 
   // Reset particle tallies once accumulated

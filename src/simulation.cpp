@@ -341,6 +341,10 @@ int openmc_next_batch(int* status)
       }
     }
 
+    // Fold the per-thread accumulators into the shared globals (once per
+    // generation, serially — see flush_thread_accumulators)
+    flush_thread_accumulators();
+
     // Accumulate time for transport
     simulation::time_transport.stop();
 
@@ -821,8 +825,7 @@ void initialize_particle_track(
 
   // Add particle's starting weight to count for normalizing tallies later
   if (!is_secondary) {
-#pragma omp atomic
-    simulation::total_weight += p.wgt();
+    thread_accumulate_source_weight(p.wgt());
   }
 
   // Force calculation of cross-sections by setting last energy to zero

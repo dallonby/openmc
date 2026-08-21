@@ -69,6 +69,7 @@ struct GpuGeomData {
   GLOBAL const GpuMaterial* materials;
   GLOBAL const int32_gpu* i32;
   GLOBAL const float* f32;
+  uint32_gpu surf_adj_off; // see GpuControl::surf_adj_off
 };
 
 // ---------------------------------------------------------- surface math --
@@ -788,6 +789,36 @@ DEVICE_FN bool gpu_local_find_cell(
     gpu_coord_reset(&p->coord[i]);
   p->coord[p->n_coord - 1].cell = GPU_C_NONE;
   return gpu_find_cell_inner(g, p, levels);
+}
+
+//! Surface-crossing relocation: the cell entered through surface S is one of
+//! the few cells whose region references S (the CPU's neighbor lists are
+//! the same idea, built lazily); test only those, in the current universe,
+//! before falling back to the full universe scan. A 60-cell slab otherwise
+//! pays ~60 contains() per crossing — measured at ~50% of device time.
+DEVICE_FN bool gpu_local_find_cell_adj(
+  GpuGeomData g, THREAD GpuGeomState* p, int32_gpu levels)
+{
+  int32_gpu s = p->surface > 0 ? p->surface : -p->surface;
+  if (s > 0) {
+    int32_gpu lev = p->n_coord - 1;
+    GLOBAL const int32_gpu* lst = g.i32 + g.i32[g.surf_adj_off + (s - 1)];
+    int32_gpu n = lst[0];
+    int32_gpu univ = p->coord[lev].universe;
+    for (int32_gpu k = 0; k < n; ++k) {
+      int32_gpu ic = lst[1 + k];
+      if (g.cells[ic].universe != univ)
+        continue;
+      if (gpu_cell_contains(
+            g, ic, p->coord[lev].r, p->coord[lev].u, p->surface)) {
+        for (int i = p->n_coord; i < GPU_MAX_COORD; ++i)
+          gpu_coord_reset(&p->coord[i]);
+        p->coord[lev].cell = ic;
+        return gpu_find_cell_inner(g, p, levels);
+      }
+    }
+  }
+  return gpu_local_find_cell(g, p, levels);
 }
 
 //! distance_to_boundary: min over all coordinate levels of cell-surface and

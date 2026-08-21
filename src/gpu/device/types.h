@@ -53,7 +53,9 @@
 
 // Maximum geometry nesting depth supported by the fixed-size coordinate
 // stack in kernels. Flattening fails (falls back to CPU) if exceeded.
-#define GPU_MAX_COORD 8
+#ifndef GPU_MAX_COORD
+#define GPU_MAX_COORD 8 // runtime MSL compile specializes to n_coord_levels+1
+#endif
 
 // ---------------------------------------------------------------------------
 // Surfaces
@@ -188,7 +190,9 @@ struct GpuMesh { // regular structured mesh
 // Filters per tally are bounded so the device can enumerate every
 // combination of per-level filter matches (cell/universe filters can match
 // at several coordinate levels; CPU FilterBinIter scores the product).
-#define GPU_MAX_TALLY_FILTERS 4
+#ifndef GPU_MAX_TALLY_FILTERS
+#define GPU_MAX_TALLY_FILTERS 4 // runtime MSL compile specializes to the model max
+#endif
 
 struct GpuTallyDesc {
   uint32_gpu accum_off; // f32 accumulator arena offset
@@ -260,6 +264,9 @@ struct GpuControl {
   // deep-penetration front bin, -0.07% at 1e6).
   uint32_gpu tally_accum_stride; // floats per bank (= tally_accum_size)
   uint32_gpu tally_replicas;    // number of banks (power of two)
+  // i32 arena: per-surface adjacency index (n_surfaces offsets, each to a
+  // [count, cell...] list of the cells whose region references the surface)
+  uint32_gpu surf_adj_off;
 };
 
 // device trace record (debug)

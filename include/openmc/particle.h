@@ -131,6 +131,12 @@ public:
 
 void add_surf_source_to_bank(Particle& p, const Surface& surf);
 
+//! Per-thread accumulation of the hot per-particle globals (source weight,
+//! keff tallies, leakage): particles add to a padded per-thread slot and the
+//! slots are flushed into the globals once per generation.
+void thread_accumulate_source_weight(double w);
+void flush_thread_accumulators();
+
 } // namespace openmc
 
 #endif // OPENMC_PARTICLE_H

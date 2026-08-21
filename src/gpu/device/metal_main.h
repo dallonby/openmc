@@ -38,6 +38,7 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   geom.lattices = lattices;
   geom.materials = materials;
   geom.i32 = i32_arena;
+  geom.surf_adj_off = ctl.surf_adj_off;
   geom.f32 = f32_arena;
 
   GpuCeView ce;

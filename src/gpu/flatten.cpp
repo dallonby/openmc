@@ -226,6 +226,32 @@ bool flatten_cells(FlatModel& m)
     }
     m.cells.push_back(gc);
   }
+
+  // per-surface adjacency: the cells whose region references each surface
+  // (device crossing relocation tests these before a full universe scan)
+  {
+    std::vector<std::vector<int32_t>> adj(m.surfaces.size());
+    for (size_t ic = 0; ic < m.cells.size(); ++ic) {
+      const GpuCell& gc = m.cells[ic];
+      for (uint32_t t = 0; t < gc.n_tokens; ++t) {
+        int32_t tok = m.i32[gc.token_off + t];
+        if (tok >= GPU_OP_UNION || tok <= -GPU_OP_UNION)
+          continue;
+        int32_t si = (tok > 0 ? tok : -tok) - 1;
+        if (si >= 0 && (size_t)si < adj.size() &&
+            (adj[si].empty() || adj[si].back() != (int32_t)ic))
+          adj[si].push_back((int32_t)ic);
+      }
+    }
+    m.surf_adj_off = (uint32_t)m.i32.size();
+    m.i32.resize(m.i32.size() + adj.size(), 0);
+    for (size_t si = 0; si < adj.size(); ++si) {
+      m.i32[m.surf_adj_off + si] = (int32_t)m.i32.size();
+      m.i32.push_back((int32_t)adj[si].size());
+      for (int32_t ic : adj[si])
+        m.i32.push_back(ic);
+    }
+  }
   return true;
 }
 

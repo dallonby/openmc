@@ -12,6 +12,7 @@
 #include "openmc/gpu_interface.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -236,6 +237,7 @@ namespace gpu {
 namespace {
 
 struct Engine {
+  double t_source = 0.0, t_dispatch = 0.0, t_post = 0.0; // host phase timers
   void* ctx = nullptr;
   FlatModel flat;
   bool active = false;
@@ -368,9 +370,23 @@ void try_initialize()
     return;
   }
 
-  // compile device source
-  std::string src(
-    reinterpret_cast<const char*>(openmc_gpu_msl), (size_t)openmc_gpu_msl_len);
+  // compile device source, specialized to this model: the per-thread array
+  // bounds (nuclides per material, coordinate depth, filters per tally,
+  // secondary stack) size the kernel's stack/register footprint and hence
+  // occupancy — the worst-case defaults cost up to ~2x on simple models
+  uint32_t max_nuc = 1;
+  for (const auto& m : eng.flat.materials)
+    max_nuc = std::max(max_nuc, m.n_nuclides);
+  uint32_t max_filt = 1;
+  for (const auto& t : eng.flat.tallies)
+    max_filt = std::max(max_filt, t.n_filters);
+  std::string preamble = fmt::format(
+    "#define GPU_MAX_MAT_NUCLIDES {}\n#define GPU_MAX_COORD {}\n"
+    "#define GPU_MAX_TALLY_FILTERS {}\n#define GPU_MAX_SECONDARY_STACK {}\n",
+    max_nuc, model::n_coord_levels + 1, max_filt, settings::run_CE ? 8 : 1);
+  std::string src = preamble +
+    std::string(reinterpret_cast<const char*>(openmc_gpu_msl),
+      (size_t)openmc_gpu_msl_len);
   char err[4096];
   if (omg_metal_compile(eng.ctx, src.c_str(), err, sizeof(err))) {
     fail(fmt::format("device kernel compilation failed: {}", err));
@@ -442,6 +458,7 @@ void try_initialize()
 
 void transport_generation()
 {
+  auto t_gen0 = std::chrono::steady_clock::now();
   int64_t n = simulation::work_per_rank;
 
   // ---- control block ----
@@ -483,6 +500,7 @@ void transport_generation()
   ctl->free_gas_threshold = (float)settings::free_gas_threshold;
   ctl->tally_accum_stride = eng.flat.tally_accum_size;
   ctl->tally_replicas = eng.tally_replicas;
+  ctl->surf_adj_off = eng.flat.surf_adj_off;
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -497,8 +515,7 @@ void transport_generation()
   auto* src =
     static_cast<GpuSourceSite*>(omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
   double src_weight = 0.0;
-  auto upload_site = [src](int64_t i, const SourceSite& s) {
-    GpuSourceSite& g = src[i];
+  auto fill_site = [](GpuSourceSite& g, const SourceSite& s) {
     g.r[0] = (float)s.r.x;
     g.r[1] = (float)s.r.y;
     g.r[2] = (float)s.r.z;
@@ -512,27 +529,60 @@ void transport_generation()
     g.parent_id = 0;
     g.progeny_id = 0;
   };
+  // Fixed-source sites do not depend on transport results, so the NEXT
+  // generation's sites are sampled while this generation's kernel runs
+  // (measured: host sampling was ~22% of wall time). The prefetch uses the
+  // next generation's seed base (+n_particles: only overall_generation
+  // advances within a run) and is bit-identical to on-demand sampling;
+  // OPENMC_GPU_NO_PREFETCH=1 disables it for that check.
+  static std::vector<GpuSourceSite> prefetched;
+  static double prefetched_weight = 0.0;
+  static bool have_prefetch = false;
+  const bool prefetch_ok = settings::run_mode == RunMode::FIXED_SOURCE &&
+                           !std::getenv("OPENMC_GPU_NO_PREFETCH");
+  if (std::getenv("OPENMC_GPU_PREFETCH_DEBUG"))
+    std::fprintf(stderr,
+      "[prefetch-debug] batch %d gen %d overall %d total_gen %lld id(1)=%lld "
+      "have_prefetch=%d\n",
+      simulation::current_batch, simulation::current_gen, overall_generation_(),
+      (long long)simulation::total_gen,
+      (long long)compute_transport_seed(compute_particle_id(1)),
+      (int)have_prefetch);
   if (settings::run_mode == RunMode::FIXED_SOURCE) {
-    // CPU fixed-source samples the external source on the fly per history
-    // (initialize_history): host-sample here with the identical fp64
-    // upstream code and per-particle STREAM_SOURCE seed discipline, then
-    // upload the fp32 sites
+    if (have_prefetch) {
+      std::memcpy(src, prefetched.data(), (size_t)n * sizeof(GpuSourceSite));
+      src_weight = prefetched_weight;
+      have_prefetch = false;
+    } else {
+      // CPU fixed-source samples the external source on the fly per history
+      // (initialize_history): host-sample here with the identical fp64
+      // upstream code and per-particle STREAM_SOURCE seed discipline
 #pragma omp parallel for reduction(+ : src_weight)
-    for (int64_t i = 0; i < n; ++i) {
-      int64_t id = compute_transport_seed(compute_particle_id(i + 1));
-      uint64_t seed = init_seed(id, STREAM_SOURCE);
-      SourceSite s = sample_external_source(&seed);
-      upload_site(i, s);
-      src_weight += s.wgt;
+      for (int64_t i = 0; i < n; ++i) {
+        int64_t id = compute_transport_seed(compute_particle_id(i + 1));
+        uint64_t seed = init_seed(id, STREAM_SOURCE);
+        SourceSite s = sample_external_source(&seed);
+        fill_site(src[i], s);
+        src_weight += s.wgt;
+      }
     }
   } else {
     for (int64_t i = 0; i < n; ++i) {
       const SourceSite& s = simulation::source_bank[i];
-      upload_site(i, s);
+      fill_site(src[i], s);
       src_weight += s.wgt;
     }
   }
   simulation::total_weight += src_weight;
+  if (std::getenv("OPENMC_GPU_PREFETCH_DEBUG")) {
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(src);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t k = 0; k < (size_t)n * sizeof(GpuSourceSite) / 4; ++k)
+      h = (h ^ w[k]) * 1099511628211ull;
+    std::fprintf(stderr, "[prefetch-debug] source hash %016llx\n",
+      (unsigned long long)h);
+  }
+  auto t_gen1 = std::chrono::steady_clock::now();
 
   // ---- zero per-generation accumulators ----
   std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS), 0,
@@ -957,6 +1007,7 @@ void transport_generation()
     geom.lattices = eng.flat.lattices.data();
     geom.i32 = eng.flat.i32.data();
     geom.f32 = eng.flat.f32.data();
+    geom.surf_adj_off = eng.flat.surf_adj_off;
     GpuMgView mgv;
     mgv.mats = eng.flat.mgmats.data();
     mgv.i32 = eng.flat.i32.data();
@@ -1018,13 +1069,35 @@ void transport_generation()
     }
   }
 
-  // ---- dispatch ----
+  // ---- dispatch (async) + overlapped prefetch of the next source ----
   char err[1024];
-  if (omg_metal_dispatch(
+  if (omg_metal_dispatch_async(
         eng.ctx, "openmc_transport", (unsigned)n, err, sizeof(err))) {
     fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
   }
+  const bool last_generation =
+    simulation::current_batch >= settings::n_batches &&
+    simulation::current_gen >= settings::gen_per_batch;
+  if (prefetch_ok && !last_generation) {
+    prefetched.resize((size_t)n);
+    double w = 0.0;
+#pragma omp parallel for reduction(+ : w)
+    for (int64_t i = 0; i < n; ++i) {
+      int64_t id = compute_transport_seed(compute_particle_id(i + 1)) +
+                   settings::n_particles;
+      uint64_t seed = init_seed(id, STREAM_SOURCE);
+      SourceSite s = sample_external_source(&seed);
+      fill_site(prefetched[i], s);
+      w += s.wgt;
+    }
+    prefetched_weight = w;
+    have_prefetch = true;
+  }
+  if (omg_metal_wait(eng.ctx, err, sizeof(err))) {
+    fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
+  }
   eng.gpu_seconds += omg_metal_last_time(eng.ctx);
+  auto t_gen2 = std::chrono::steady_clock::now();
 
   // ---- counters ----
   auto* ctr =
@@ -1159,10 +1232,20 @@ void transport_generation()
       }
     }
   }
+  auto t_gen3 = std::chrono::steady_clock::now();
+  eng.t_source += std::chrono::duration<double>(t_gen1 - t_gen0).count();
+  eng.t_dispatch += std::chrono::duration<double>(t_gen2 - t_gen1).count();
+  eng.t_post += std::chrono::duration<double>(t_gen3 - t_gen2).count();
 }
 
 void finalize()
 {
+  if (std::getenv("OPENMC_GPU_TIMING")) {
+    std::fprintf(stderr,
+      "[gpu-timing] host source/upload %.3f s, dispatch(wait) %.3f s "
+      "(device %.3f s), copy-back %.3f s\n",
+      eng.t_source, eng.t_dispatch, eng.gpu_seconds, eng.t_post);
+  }
   if (const char* lm = std::getenv("OPENMC_LEAK_MAP")) {
     if (!gpu_leak_map.empty()) {
       std::string path = std::string(lm) + ".gpu";

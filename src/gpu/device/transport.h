@@ -33,8 +33,16 @@ void gpu_host_leak(int64_gpu id);
 void gpu_host_stat_fsite(float r);
 #endif
 
+// Per-thread array bounds. Defaults serve the host replay build; the runtime
+// MSL compile prepends model-specialized values (max nuclides per material,
+// n_coord_levels+1, max filters per tally) so per-thread stack/register use
+// — and therefore occupancy — tracks the model instead of the worst case.
+#ifndef GPU_MAX_MAT_NUCLIDES
 #define GPU_MAX_MAT_NUCLIDES 32
+#endif
+#ifndef GPU_MAX_SECONDARY_STACK
 #define GPU_MAX_SECONDARY_STACK 8
+#endif
 
 // ------------------------------------------------------------- tally view --
 struct GpuTallyView {
@@ -142,7 +150,9 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
     }
     if (miss)
       continue;
-    int32_gpu idx[GPU_MAX_TALLY_FILTERS] = {0, 0, 0, 0};
+    int32_gpu idx[GPU_MAX_TALLY_FILTERS];
+    for (uint32_gpu fi = 0; fi < td.n_filters; ++fi)
+      idx[fi] = 0;
     for (;;) {
       int32_gpu flat = 0;
       for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
@@ -324,6 +334,19 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 
   // per-material micro cache (CE)
   GpuMicroXS micros[GPU_MAX_MAT_NUCLIDES];
+  // macro/micro XS cache: CPU skips recalculation when material, energy and
+  // density multiplier are unchanged (a surface crossing changes none of
+  // them), so a flight that ends at a boundary costs no XS lookups
+  GpuMacroXS xs;
+  xs.total = 0.0f;
+  xs.absorption = 0.0f;
+  xs.fission = 0.0f;
+  xs.nu_fission = 0.0f;
+  GpuMaterial mat;
+  mat.n_nuclides = 0;
+  int32_gpu xs_key_mat = -2;
+  float xs_key_E = -1.0f;
+  float xs_key_dm = 0.0f;
 
   bool found =
     gpu_exhaustive_find_cell(geom, &gs, ctl.root_universe, ctl.n_coord_levels);
@@ -358,16 +381,19 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   for (;;) {
     // ---- event loop ----
     while (wgt > 0.0f) {
-      // event_calculate_xs
-      GpuMacroXS xs;
-      xs.total = 0.0f;
-      xs.absorption = 0.0f;
-      xs.fission = 0.0f;
-      xs.nu_fission = 0.0f;
+      // event_calculate_xs (cached, see above)
       float mac_scat = 0.0f;
       float mac_elastic = 0.0f;
-      GpuMaterial mat;
-      mat.n_nuclides = 0;
+      if (gs.material != xs_key_mat || E != xs_key_E ||
+          gs.density_mult != xs_key_dm) {
+        xs_key_mat = gs.material;
+        xs_key_E = E;
+        xs_key_dm = gs.density_mult;
+        xs.total = 0.0f;
+        xs.absorption = 0.0f;
+        xs.fission = 0.0f;
+        xs.nu_fission = 0.0f;
+        mat.n_nuclides = 0;
       if (gs.material != GPU_MATERIAL_VOID) {
         if (is_ce) {
           mat = geom.materials[gs.material];
@@ -400,6 +426,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         } else {
           xs = gpu_mg_calculate_xs(mg, gs.material, g, gs.density_mult);
         }
+      }
       }
 
       // event_advance
@@ -580,8 +607,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               }
             }
           } else {
-            // transmission: search from the crossing level down
-            if (!gpu_local_find_cell(geom, &gs, ctl.n_coord_levels)) {
+            // transmission: search from the crossing level down, trying
+            // the crossed surface's adjacent cells first
+            if (!gpu_local_find_cell_adj(geom, &gs, ctl.n_coord_levels)) {
               if (!gpu_exhaustive_find_cell(
                     geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
                 gs.surface = GPU_SURFACE_NONE;

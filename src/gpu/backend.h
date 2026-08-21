@@ -60,6 +60,13 @@ void* omg_metal_contents(void* ctx, int slot);
 int omg_metal_dispatch(
   void* ctx, const char* fn, unsigned int nthreads, char* err, int errcap);
 
+//! Dispatch without waiting; pair with omg_metal_wait (one in flight).
+int omg_metal_dispatch_async(
+  void* ctx, const char* fn, unsigned int nthreads, char* err, int errcap);
+
+//! Wait for the in-flight async dispatch; returns nonzero on device error.
+int omg_metal_wait(void* ctx, char* err, int errcap);
+
 //! GPU time of the last dispatch in seconds
 double omg_metal_last_time(void* ctx);
 

@@ -20,6 +20,7 @@ struct MetalCtx {
   NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* psos = nil;
   id<MTLBuffer> buffers[OMG_SLOT_COUNT] = {};
   double last_time = 0.0;
+  id<MTLCommandBuffer> pending = nil; // in-flight async dispatch
   std::string device_name;
 };
 
@@ -167,6 +168,68 @@ int omg_metal_dispatch(
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      set_err(err, errcap, cb.error.localizedDescription);
+      return 1;
+    }
+    ctx->last_time = cb.GPUEndTime - cb.GPUStartTime;
+    return 0;
+  }
+}
+
+int omg_metal_dispatch_async(
+  void* vctx, const char* fn, unsigned int nthreads, char* err, int errcap)
+{
+  auto* ctx = static_cast<MetalCtx*>(vctx);
+  if (nthreads == 0)
+    return 0;
+  @autoreleasepool {
+    NSString* name = @(fn);
+    id<MTLComputePipelineState> pso = ctx->psos[name];
+    if (!pso) {
+      id<MTLFunction> f = [ctx->library newFunctionWithName:name];
+      if (!f) {
+        set_err(err, errcap,
+          [NSString stringWithFormat:@"kernel '%s' not found", fn]);
+        return 1;
+      }
+      NSError* nserr = nil;
+      pso = [ctx->device newComputePipelineStateWithFunction:f error:&nserr];
+      if (!pso) {
+        set_err(err, errcap, nserr.localizedDescription);
+        return 1;
+      }
+      ctx->psos[name] = pso;
+    }
+
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    for (int i = 0; i < OMG_SLOT_COUNT; ++i) {
+      if (ctx->buffers[i])
+        [enc setBuffer:ctx->buffers[i] offset:0 atIndex:(NSUInteger)i];
+    }
+    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+    if (tg > 256)
+      tg = 256;
+    [enc dispatchThreads:MTLSizeMake(nthreads, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    ctx->pending = cb;
+    return 0;
+  }
+}
+
+int omg_metal_wait(void* vctx, char* err, int errcap)
+{
+  auto* ctx = static_cast<MetalCtx*>(vctx);
+  if (!ctx->pending)
+    return 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = ctx->pending;
+    [cb waitUntilCompleted];
+    ctx->pending = nil;
     if (cb.status == MTLCommandBufferStatusError) {
       set_err(err, errcap, cb.error.localizedDescription);
       return 1;

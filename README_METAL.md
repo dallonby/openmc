@@ -104,6 +104,7 @@ run proceeds normally on the CPU.
 | CE PWR pincell **with S(a,b)** (3M active) | 1.23691 ± 0.00054 | 1.23734 ± 0.00052 | 0.6σ; 58 tally bins |
 | CE Godiva bare HEU sphere (1M active) | 1.00125 ± 0.00059 | 1.00138 ± 0.00071 | 0.1σ |
 | CE Godiva bare HEU sphere (11M active) | 1.00041 ± 0.00022 | 1.00017 ± 0.00021 | 0.8σ (Δ = −24 pcm); leakage fraction agrees to 0.9σ |
+| CE Godiva bare HEU sphere (400M active) | 1.000051 ± 0.000032 | 1.000013 ± 0.000035 | **Δ = −3.8 ± 4.7 pcm** — any residual fp32-vs-fp64 bias is within [−13, +6] pcm at 95%; leakage fraction identical (0.57310) |
 
 A device-vs-host ensemble discrepancy on Godiva (−630 pcm) that shipped
 in the first push was root-caused to the Metal compiler miscompiling a

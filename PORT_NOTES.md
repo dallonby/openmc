@@ -141,6 +141,7 @@ the mean flight length).
 | CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23734(52) | 0.6 sigma; 58 tally bins (an independent seed gave +1.9 sigma — jointly unremarkable) |
 | CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=1.00138(71) | 0.1 sigma |
 | CE Godiva, 11M active | k=1.00041(22) | k=1.00017(21) | 0.8 sigma (dk = -24 pcm); leakage fraction 0.57294(15) vs 0.57314(16) |
+| CE Godiva, 400M active | k=1.000051(32) | k=1.000013(35) | dk = -3.8 +/- 4.7 pcm (0.8 sigma); 95% CI on any residual fp32-vs-fp64 bias: [-13, +6] pcm. Leakage fraction 0.57310 on both engines. 16.8M histories/s on the GPU (1M/batch, no tallies) |
 
 Lost particles: ~5e-5 of histories (pincell, init-class), 0 (Godiva),
 ~7e-6 (MG lattice); counted and warned per generation.

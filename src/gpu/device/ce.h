@@ -156,9 +156,13 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
     }
     i_grid = lo;
   }
-  if (grid[i_grid] == grid[i_grid + 1])
+  // fp32 casts can collapse a RUN of adjacent fp64 knots to one value:
+  // walk to the end of the run (never past ng-2, so no OOB read), and use
+  // f = 0 if the grid ends inside a collapsed run (row i_grid, no interp)
+  while (i_grid + 2 < ng && grid[i_grid] == grid[i_grid + 1])
     ++i_grid;
-  float f = (E - grid[i_grid]) / (grid[i_grid + 1] - grid[i_grid]);
+  float dgrid = grid[i_grid + 1] - grid[i_grid];
+  float f = (dgrid > 0.0f) ? (E - grid[i_grid]) / dgrid : 0.0f;
   m.i_grid = i_grid;
   m.interp = f;
 

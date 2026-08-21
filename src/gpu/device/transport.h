@@ -14,6 +14,8 @@
 struct GpuGeomState;
 void gpu_host_debug_lost(THREAD const GpuGeomState* gs, int32_gpu tok,
   GpuVec3 r0, GpuVec3 u0, GpuVec3 u_new);
+void gpu_host_debug_lost_where(int where, THREAD const GpuGeomState* gs,
+  float E);
 void gpu_host_debug_exit(
   THREAD const GpuGeomState* gs, float distance, float d_coll);
 void gpu_host_stat_collision(float E, float r);
@@ -232,11 +234,32 @@ struct GpuSecondary {
   float time;
 };
 
-//! neutron speed in cm/s (Particle::speed, relativistic)
+//! neutron speed in cm/s (Particle::speed, relativistic). Uses the CPU's
+//! cancellation-free form C*sqrt(E(E+2m))/(E+m): the 1-(m/(E+m))^2 form
+//! collapses to exactly 0 below ~32 eV in fp32 (ulp(m) is 64 eV), which
+//! made every thermal flight time infinite.
 DEVICE_FN float gpu_neutron_speed(float E)
 {
-  float inv = 939.56542052e6f / (E + 939.56542052e6f);
-  return 2.99792458e10f * sqrtf(fmaxf(0.0f, 1.0f - inv * inv));
+  float m = 939.56542052e6f;
+  return 2.99792458e10f * sqrtf(E * (E + 2.0f * m)) / (E + m);
+}
+
+//! fp32 relocation rescue: escalating nudges along the current direction
+//! (1x, 8x, 64x TINY_BIT — at most ~7e-4 cm total) with a root re-search
+//! after each. A crossing at a corner can sit inside the fp32 sign band of
+//! a second, coincident surface, where a single TINY_BIT does not clear
+//! the band and the containment test keeps flipping.
+DEVICE_FN bool gpu_rescue_find_cell(
+  GpuGeomData geom, THREAD GpuGeomState* gs, int32_gpu root, int32_gpu levels)
+{
+  float step = GPU_TINY_BIT;
+  for (int s = 0; s < 3; ++s) {
+    gpu_move_distance(gs, step);
+    if (gpu_exhaustive_find_cell(geom, gs, root, levels))
+      return true;
+    step *= 8.0f;
+  }
+  return false;
 }
 
 //! total delayed nu for a CE nuclide (sum of per-group yields of the
@@ -305,19 +328,28 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   bool found =
     gpu_exhaustive_find_cell(geom, &gs, ctl.root_universe, ctl.n_coord_levels);
   if (!found) {
-    // fp32 source positions can sit epsilon-outside at boundaries; try a
-    // nudge along the flight direction, then against it (sites born at a
-    // wall with outward-pointing directions need the latter)
-    gpu_move_distance(&gs, GPU_TINY_BIT);
-    found = gpu_exhaustive_find_cell(
-      geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+    // fp32 source positions can sit epsilon-on/outside a surface (fission
+    // sites are banked at collision points, which can lie exactly on one):
+    // escalate nudges along the flight direction, then against it (sites
+    // born at a wall with outward-pointing directions need the latter)
+    GpuVec3 r_born = gs.coord[0].r;
+    found =
+      gpu_rescue_find_cell(geom, &gs, ctl.root_universe, ctl.n_coord_levels);
     if (!found) {
-      gpu_move_distance(&gs, -2.0f * GPU_TINY_BIT);
-      found = gpu_exhaustive_find_cell(
-        geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+      gs.coord[0].r = r_born;
+      float step = -GPU_TINY_BIT;
+      for (int s = 0; s < 3 && !found; ++s) {
+        gpu_move_distance(&gs, step);
+        found = gpu_exhaustive_find_cell(
+          geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+        step *= 8.0f;
+      }
     }
   }
   if (!found) {
+#ifdef GPU_HOST_DEBUG
+    gpu_host_debug_lost_where(1, &gs, E);
+#endif
     gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
     gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_INIT, 1u);
     wgt = 0.0f;
@@ -373,6 +405,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       // event_advance
       gs.boundary = gpu_distance_to_boundary(geom, &gs);
       if (gs.lost) {
+#ifdef GPU_HOST_DEBUG
+        gpu_host_debug_lost_where(2, &gs, E);
+#endif
         gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
         gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_ADVANCE, 1u);
         wgt = 0.0f;
@@ -386,9 +421,11 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         // grazing tangency can hide every surface in fp32: nudge and
         // re-resolve (bounded by the event cap)
         gs.surface = GPU_SURFACE_NONE;
-        gpu_move_distance(&gs, GPU_TINY_BIT);
-        if (!gpu_exhaustive_find_cell(
+        if (!gpu_rescue_find_cell(
               geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
+#ifdef GPU_HOST_DEBUG
+          gpu_host_debug_lost_where(3, &gs, E);
+#endif
           gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
           gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_ADVANCE, 1u);
           wgt = 0.0f;
@@ -514,17 +551,23 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             }
             float un = gpu_norm(u_new);
             u_new = gpu_scale(u_new, 1.0f / un);
+            // CPU cross_reflective_bc PINS the root cell (coord(0).cell =
+            // cell_last(0)) and re-finds only the lower universes: the
+            // reflected particle is still in the same root-level cell, and
+            // never re-deciding root containment is what stops corner
+            // reflections from coin-flipping out on the second surface's
+            // fp32 sign (previously the dominant pincell loss class). The
+            // descent itself is still needed to rebuild lattice/universe
+            // levels below the root.
             gs.surface = -tok;
             gs.coord[0].r = r0;
             gs.coord[0].u = u_new;
             gs.n_coord = 1;
-            if (!gpu_exhaustive_find_cell(
-                  geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
-              // corner reflection can land epsilon-outside: nudge along
-              // the reflected (inward) direction and retry
+            for (int lv = 1; lv < GPU_MAX_COORD; ++lv)
+              gpu_coord_reset(&gs.coord[lv]);
+            if (!gpu_find_cell_inner(geom, &gs, ctl.n_coord_levels)) {
               gs.surface = GPU_SURFACE_NONE;
-              gpu_move_distance(&gs, GPU_TINY_BIT);
-              if (!gpu_exhaustive_find_cell(
+              if (!gpu_rescue_find_cell(
                     geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
 #ifdef GPU_HOST_DEBUG
                 gpu_host_debug_lost(&gs, tok, r0, u0, u_new);
@@ -542,10 +585,11 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               if (!gpu_exhaustive_find_cell(
                     geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
                 gs.surface = GPU_SURFACE_NONE;
-                gpu_move_distance(&gs, GPU_TINY_BIT);
-                if (!gpu_exhaustive_find_cell(
+                if (!gpu_rescue_find_cell(
                       geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
                   gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+                  gpu_atomic_add_u32(
+                    banks.counters + GPU_CTR_LOST_ADVANCE, 1u);
                   wgt = 0.0f;
                   break;
                 }
@@ -557,9 +601,15 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         // ---- event_collide ----
         k_col += wgt * xs.nu_fission / xs.total;
         // preserved for post-collision cell reconciliation (particle.cpp)
-        bool near_surface = (gs.surface != GPU_SURFACE_NONE);
+        int32_gpu presurf = gs.surface;
+        bool near_surface = (presurf != GPU_SURFACE_NONE);
         gs.surface = GPU_SURFACE_NONE;
         float E_pre = E;
+#ifdef GPU_HOST_DEBUG
+        if (!gpu_cell_contains(
+              geom, gs.coord[0].cell, gs.coord[0].r, gs.coord[0].u, presurf))
+          gpu_host_debug_lost_where(7, &gs, E);
+#endif
 #ifdef GPU_HOST_DEBUG
         gpu_host_stat_collision(E, gpu_norm(gs.coord[0].r));
 #endif
@@ -648,7 +698,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 (nuc.n_delayed > 0) ? gpu_ce_nu_delayed(ce, nuc, E) : 0.0f;
               float beta = (nu_tot > 0.0f) ? nu_d / nu_tot : 0.0f;
               int32_gpu dg = 0; // product index (0 = prompt)
-              if (nuc.n_delayed > 0 && gpu_prn(&seeds[stream]) < beta) {
+              // CPU draws the prompt/delayed RN unconditionally, even when
+              // beta == 0 (sample_fission_neutron) — keep the stream paired
+              float beta_xi = gpu_prn(&seeds[stream]);
+              if (nuc.n_delayed > 0 && beta_xi < beta) {
                 // CPU walks the SELECTED reaction's delayed-product yields
                 // (rx.products_[group]); fall back to the first fission
                 // reaction only when the partial carries no delayed
@@ -853,7 +906,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               int32_gpu yblob = rx[GPU_RX_YIELD];
               if (yblob >= 0) {
                 float y = gpu_f1d(ce, yblob, E_in);
-                if (floorf(y) == y && y > 0.0f) {
+                // integral yield -> clones; Particle::create_secondary
+                // rejects secondaries below the energy cutoff at creation
+                if (floorf(y) == y && y > 0.0f && E >= ctl.energy_cutoff) {
                   int32_gpu extra = (int32_gpu)(y + 0.5f) - 1;
                   for (int32_gpu q = 0; q < extra; ++q) {
                     if (n_stack < GPU_MAX_SECONDARY_STACK) {
@@ -960,11 +1015,16 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           }
         }
 
-        // reconcile_cell_after_collision (geometry.cpp): a direction change
-        // during a near-surface collision can leave the cell chain
-        // inconsistent with the new direction (the on-surface token decided
-        // membership before; it is cleared now)
-        if (near_surface && wgt > 0.0f) {
+        // reconcile_cell_after_collision (geometry.cpp), run on EVERY
+        // collision: CPU gates this on a near-surface token, but an fp32
+        // flight can overshoot a surface by more than TINY_BIT (token
+        // already cleared) and collide epsilon-outside its cell — a stale
+        // chain then transports through walls (the infinite wall planes
+        // keep reflecting the escapee outside the box forever). The repair
+        // runs in place (a trial copy of the coordinate state costs enough
+        // stack to collapse occupancy); an unrepairable state is lost,
+        // as on the CPU.
+        if (wgt > 0.0f) {
           int32_gpu invalid_level = -1;
           for (int32_gpu lev = 0; lev < gs.n_coord; ++lev) {
             if (gs.coord[lev].cell == GPU_C_NONE ||
@@ -980,10 +1040,30 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               gs.n_coord = invalid_level + 1;
               fixed = gpu_local_find_cell(geom, &gs, ctl.n_coord_levels);
             }
-            if (!fixed &&
-                !gpu_exhaustive_find_cell(
-                  geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
+            if (!fixed)
+              fixed = gpu_exhaustive_find_cell(
+                geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+            if (!fixed) {
+              // overshoot rescue: escalating nudges against, then along,
+              // the outgoing direction (the overshoot was along the OLD
+              // flight direction, so either sign may point back inside)
+              GpuVec3 r_c = gs.coord[0].r;
+              float step = -GPU_TINY_BIT;
+              for (int s = 0; s < 3 && !fixed; ++s) {
+                gpu_move_distance(&gs, step);
+                fixed = gpu_exhaustive_find_cell(
+                  geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+                step *= 8.0f;
+              }
+              if (!fixed) {
+                gs.coord[0].r = r_c;
+                fixed = gpu_rescue_find_cell(
+                  geom, &gs, ctl.root_universe, ctl.n_coord_levels);
+              }
+            }
+            if (!fixed) {
               gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_RECONCILE, 1u);
               wgt = 0.0f;
             }
           }

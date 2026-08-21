@@ -132,19 +132,23 @@ top-24-bit `(bits + 0.5) * 2^-24` in (0,1) instead of 53-bit fp64 —
 midpoint offset keeps `log(xi)` finite without measurable bias (1.8e-8 on
 the mean flight length).
 
-## Validation status (2026-08-21, after the cross-review fix wave)
+## Validation status (2026-08-21, after both review fix waves)
 
 | Case | CPU | GPU | Agreement |
 |---|---|---|---|
-| 7-group MG 3x3 pin lattice, 10M active | k=1.34156(24) | k=1.34171(24) | 0.4 sigma; 70 tally bins |
+| 7-group MG 3x3 pin lattice, 10M active | k=1.34156(24) | k=1.34172(23) | 0.5 sigma; 70 tally bins; **0 lost particles** |
 | CE PWR pincell (no S(a,b)), 3M active | k=1.23939(57) | k=1.23923(52) | 0.2 sigma; 58 tally bins |
-| CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23734(52) | 0.6 sigma; 58 tally bins (an independent seed gave +1.9 sigma — jointly unremarkable) |
-| CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=1.00138(71) | 0.1 sigma |
+| CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23691(53) | 0.0 sigma; 58 tally bins |
+| CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=1.00138(71) | 0.1 sigma; 0 lost |
 | CE Godiva, 11M active | k=1.00041(22) | k=1.00017(21) | 0.8 sigma (dk = -24 pcm); leakage fraction 0.57294(15) vs 0.57314(16) |
 | CE Godiva, 400M active | k=1.000051(32) | k=1.000013(35) | dk = -3.8 +/- 4.7 pcm (0.8 sigma); 95% CI on any residual fp32-vs-fp64 bias: [-13, +6] pcm. Leakage fraction 0.57310 on both engines. 16.8M histories/s on the GPU (1M/batch, no tallies) |
 
-Lost particles: ~5e-5 of histories (pincell, init-class), 0 (Godiva),
-~7e-6 (MG lattice); counted and warned per generation.
+Lost particles after the fp32 geometry hardening (below): 0 (MG lattice,
+11M histories), 0 (Godiva), 8 per 3.4M (S(a,b) pincell — reconcile-class
+residual, 2.4e-6). The GPU feeds `simulation::n_lost_particles` and
+enforces the upstream abort thresholds (`max_lost_particles` /
+`rel_max_lost_particles`), checked per generation; models that exceed
+them can raise the standard settings exactly as on the CPU.
 
 Cross-ISA check of the CPU reference itself: an x86_64 build of this tree
 run under Rosetta 2 reproduces the native arm64 build **bit-for-bit** on
@@ -262,6 +266,77 @@ correctness items:
 * **Trace counter** got its own slot (`GPU_CTR_TRACE`) instead of
   aliasing `GPU_CTR_LOST_REFLECT`; fission-bank overflow now warns like
   CPU; the CPU-side `OPENMC_ISO_MU` ablation hook caches its `getenv`.
+
+## 2026-08-21 second review (Codex) and the fp32 geometry hardening
+
+A second independent review pass (Codex CLI, reading the post-fix tree)
+confirmed the recursion root-cause section above and surfaced a further
+set of verified findings, all fixed:
+
+* **fp32 neutron speed** used `1-(m/(E+m))^2`, which cancels to exactly 0
+  below ~32 eV (ulp of the neutron mass is 64 eV) — every thermal flight
+  time was infinite. Now the CPU's `C*sqrt(E(E+2m))/(E+m)` form.
+* **Differential tallies** were silently scored as ordinary tallies —
+  rejected at flatten. Likewise rejected: surface-source writing,
+  collision-track output, overlap checking, track output, N-body laws
+  with n outside 3..5.
+* **Lost-particle accounting** now feeds `simulation::n_lost_particles`
+  and enforces the upstream dual-threshold abort per generation;
+  secondary-stack overflow ((n,xn) clones) is fatal instead of a warning;
+  below-cutoff clones are not created (CPU `create_secondary` parity).
+* **Flatten hardening**: a fissionable nuclide without a usable nu
+  function rejects; a sticky-error catch-all rejects any nuclide whose
+  nested law recorded an unsupported construct; CE grid fp32 casts that
+  collapse RUNS of knots are walked safely on device (no zero-division /
+  OOB at the grid tail).
+* **Complex-region crossing bound** is now the geometric maximum
+  (2 crossings per quadric token) instead of a fixed 64.
+* **RN parity**: the prompt/delayed RN is drawn even when a nuclide has
+  no delayed groups (CPU draws it unconditionally).
+
+The loss investigation this triggered ended with the fp32 geometry
+hardening — the lost-particle rate on moderated/lattice models dropped
+from ~5e-5 to 0–2.4e-6 with no measurable throughput cost:
+
+1. **Lattice-exit recovery** searches the outer universe in the
+   extrapolated tile frame (the frame the descent itself uses); root
+   re-search — which must re-decide an on-boundary fp32 point and
+   coin-flips — only when there is no outer universe. (A root-only
+   "CPU-faithful" version lost ~1e-4 of MG-lattice histories.)
+2. **Tile overshoot**: a negative tile-face distance (local point epsilon
+   past the face with stale indices) is an already-happened crossing —
+   taken at d = 0 and re-indexed, not marked lost.
+3. **Reflection pins the root cell** exactly like CPU
+   `cross_reflective_bc` (`coord(0).cell = cell_last(0)`), rebuilding
+   only the lower universes; re-deciding root containment at the wall
+   was the dominant pincell loss class.
+4. **Post-collision reconciliation runs on every collision** (CPU gates
+   it on a near-surface token; an fp32 flight can overshoot a surface by
+   more than TINY_BIT with the token already cleared, and a stale chain
+   then streams through walls — the infinite wall planes kept reflecting
+   escapees outside the box, whose banked fission sites failed placement
+   a generation later). The repair runs in place — a trial copy of the
+   coordinate state cost enough thread stack to collapse occupancy
+   (17x on the pincell) — with escalating bidirectional nudge rescue,
+   and an unrepairable state is lost, as on the CPU.
+5. **Directional on-surface plane logic**: the on-surface token
+   suppresses a plane only in the moving-away direction; moving back
+   produces a d = 0 crossing so BCs fire. At exactly f == 0 with no
+   token (fp32 corner quantization), the cell's own region token sign
+   disambiguates the side — without it, -0/u = +0 fabricated
+   zero-distance crossings in both directions and corner reflections
+   ping-ponged until the event cap (the pre-fix reflect re-search had
+   been killing those states as losses, masking the loop).
+
+Device-vs-replay bit identity was re-verified after the geometry
+changes: 0 disagreements on 2M paired Godiva histories.
+
+Review improvement backlog (not yet implemented): CE cross-section
+caching across non-collision events, per-thread micro-XS working-set
+reduction (occupancy), active-tally compaction + threadgroup-local tally
+reduction, optional wavefront pipeline for collision-heavy CE, compiled
+metallib caching keyed on source hash, a host-side arena validator, and
+full-width RNG-state traces.
 
 ## Debug tooling (env-gated, zero cost when unset)
 

@@ -199,6 +199,20 @@ void gpu_host_debug_exit(const GpuGeomState* gs, float distance, float d_coll)
     gs->n_coord);
 }
 
+void gpu_host_debug_lost_where(int where, const GpuGeomState* gs, float E)
+{
+  std::fprintf(stderr, "[gpu-debug] lost(site=%d) E=%g surf=%d ncoord=%d mat=%d\n",
+    where, E, gs->surface, gs->n_coord, gs->material);
+  for (int j = 0; j < gs->n_coord; ++j)
+    std::fprintf(stderr,
+      "  L%d cell=%d univ=%d lat=%d li=(%d %d %d) r=(%.7f %.7f %.7f) "
+      "u=(%.6f %.6f %.6f)\n",
+      j, gs->coord[j].cell, gs->coord[j].universe, gs->coord[j].lattice,
+      gs->coord[j].li[0], gs->coord[j].li[1], gs->coord[j].li[2],
+      gs->coord[j].r.x, gs->coord[j].r.y, gs->coord[j].r.z, gs->coord[j].u.x,
+      gs->coord[j].u.y, gs->coord[j].u.z);
+}
+
 void gpu_host_debug_lost(
   const GpuGeomState* gs, int32_gpu tok, GpuVec3 r0, GpuVec3 u0, GpuVec3 u_new)
 {
@@ -1005,13 +1019,32 @@ void transport_generation()
   uint32_t n_lost = ctr[GPU_CTR_LOST];
   if (n_lost > 0) {
     eng.lost_total += n_lost;
-    warning(fmt::format("GPU transport lost {} particles this generation "
-                        "({} total; init {} advance {} lattice {} reflect {})",
+    warning(fmt::format(
+      "GPU transport lost {} particles this generation "
+      "({} total; init {} advance {} lattice {} reflect {} reconcile {})",
       n_lost, eng.lost_total, ctr[GPU_CTR_LOST_INIT], ctr[GPU_CTR_LOST_ADVANCE],
-      ctr[GPU_CTR_LOST_LATTICE], ctr[GPU_CTR_LOST_REFLECT]));
+      ctr[GPU_CTR_LOST_LATTICE], ctr[GPU_CTR_LOST_REFLECT],
+      ctr[GPU_CTR_LOST_RECONCILE]));
+    // Feed the upstream lost-particle accounting and apply the same abort
+    // policy as Particle::mark_as_lost (checked per generation here). The
+    // thresholds are the standard settings (max_lost_particles /
+    // rel_max_lost_particles), so users accepting fp32 residual losses can
+    // raise them exactly as they would on the CPU.
+    simulation::n_lost_particles += (int)n_lost;
+    auto n_sim = simulation::current_batch * settings::gen_per_batch *
+                 simulation::work_per_rank;
+    if (simulation::n_lost_particles >= settings::max_lost_particles &&
+        simulation::n_lost_particles >=
+          settings::rel_max_lost_particles * n_sim) {
+      fatal_error("Maximum number of lost particles has been reached.");
+    }
   }
   if (ctr[GPU_CTR_SECONDARY_BANK] > 0) {
-    warning(fmt::format("GPU dropped {} (n,xn) clones (secondary stack full)",
+    // The CPU never drops (n,xn) clones (dynamically sized secondary
+    // bank); silently losing them would lose physics, so this is fatal.
+    fatal_error(fmt::format(
+      "GPU dropped {} (n,xn) clones (per-thread secondary stack full). "
+      "Deepen GPU_MAX_SECONDARY_STACK for this model.",
       ctr[GPU_CTR_SECONDARY_BANK]));
   }
   if (ctr[GPU_CTR_MAX_EVENT_HIT] > 0) {

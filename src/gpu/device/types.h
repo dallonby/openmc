@@ -44,7 +44,6 @@
 #define GPU_LAT_COINCIDENT 2.0e-6f
 
 // Bounded replacement for the CPU's unbounded distance_complex loop
-#define GPU_MAX_VIRTUAL_CROSSINGS 64
 
 // Lattice corner-tie detection: two axis distances count as a simultaneous
 // (corner) crossing only when they agree to fp32 rounding, i.e. a few ulps.
@@ -273,4 +272,5 @@ struct GpuTraceRec {
 #define GPU_CTR_LOST_REFLECT 7
 // debug event-trace cursor (OPENMC_TRACE_ID); never aliases a loss counter
 #define GPU_CTR_TRACE 8
-#define GPU_CTR_COUNT 9
+#define GPU_CTR_LOST_RECONCILE 9
+#define GPU_CTR_COUNT 10

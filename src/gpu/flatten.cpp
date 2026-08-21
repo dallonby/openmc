@@ -490,6 +490,11 @@ bool flatten_tallies(FlatModel& m)
       return reject(
         m, fmt::format("tally {} has more than {} filters (GPU v1 limit)",
              t->id(), GPU_MAX_TALLY_FILTERS));
+    if (t->deriv_ != C_NONE)
+      return reject(
+        m, fmt::format("tally {} is a differential tally (unsupported in "
+                       "GPU v1)",
+             t->id()));
 
     for (int fi = 0; fi < (int)t->filters().size(); ++fi) {
       const Filter* f = model::tally_filters[t->filters(fi)].get();
@@ -589,6 +594,15 @@ bool flatten_model(FlatModel& m)
   if (settings::res_scat_on)
     return reject(
       m, "resonance upscattering (DBRC/RVS) is not in the GPU v1 envelope");
+  if (settings::surf_source_write)
+    return reject(m, "surface-source writing is not in the GPU v1 envelope");
+  if (settings::collision_track)
+    return reject(m, "collision-track output is not in the GPU v1 envelope");
+  if (settings::check_overlaps)
+    return reject(
+      m, "overlap checking only runs in the CPU transport loop");
+  if (settings::write_all_tracks || !settings::track_identifiers.empty())
+    return reject(m, "track output is not in the GPU v1 envelope");
   if (settings::temperature_method == TemperatureMethod::INTERPOLATION)
     return reject(m, "temperature interpolation is not in the GPU v1 "
                      "envelope (use nearest)");

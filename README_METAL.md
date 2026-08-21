@@ -92,19 +92,26 @@ run proceeds normally on the CPU.
 | Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic (`free_gas_threshold` honored), S(a,b) thermal scattering (coherent/incoherent elastic, continuous + discrete inelastic), level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission, energy cutoff | windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models, temperature interpolation, NCrystal, isotropic-in-lab (p0) scattering, time cutoffs |
 | Multigroup: macroscopic isotropic MGXS, tabular/histogram scattering laws, prompt + delayed fission | angle-dependent MGXS, Legendre sampling (use the default `tabular_legendre` conversion) |
 | CSG: all quadric surface types, universes, rectangular lattices, translations/rotations, vacuum/reflective/white BCs | tori, hex lattices, periodic BCs, boundary albedo, DAGMC, distribcell/multi-instance materials |
-| Tallies: cell/material/universe/energy filters (up to 4 per tally, nested cell/universe matches score every combination as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | mesh filters (tracklength track-splitting not ported), analog estimators, nuclide bins, other filters/scores |
+| Tallies: cell/material/universe/energy filters (up to 4 per tally, nested cell/universe matches score every combination as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | mesh filters (tracklength track-splitting not ported), analog estimators, nuclide bins, differential tallies, other filters/scores |
+| Standard lost-particle accounting and abort thresholds; upstream statepoint/source outputs | track output, surface-source writing, collision-track files, overlap checking |
 | Analog capture, Russian-roulette-free transport (upstream defaults) | survival biasing, weight windows |
 
 ## Validation (M3 Ultra, ENDF/B-VIII.0, vs CPU OpenMC from this tree)
 
 | Case | CPU k | GPU k | Agreement |
 |---|---|---|---|
-| 7-group MG 3×3 pin lattice (10M active histories) | 1.34156 ± 0.00024 | 1.34171 ± 0.00024 | 0.4σ; 70 tally bins |
+| 7-group MG 3×3 pin lattice (10M active histories) | 1.34156 ± 0.00024 | 1.34172 ± 0.00023 | 0.5σ; 70 tally bins; 0 lost particles |
 | CE PWR pincell, no S(a,b) (3M active) | 1.23939 ± 0.00057 | 1.23923 ± 0.00052 | 0.2σ; 58 tally bins |
-| CE PWR pincell **with S(a,b)** (3M active) | 1.23691 ± 0.00054 | 1.23734 ± 0.00052 | 0.6σ; 58 tally bins |
-| CE Godiva bare HEU sphere (1M active) | 1.00125 ± 0.00059 | 1.00138 ± 0.00071 | 0.1σ |
+| CE PWR pincell **with S(a,b)** (3M active) | 1.23691 ± 0.00054 | 1.23691 ± 0.00053 | 0.0σ; 58 tally bins |
+| CE Godiva bare HEU sphere (1M active) | 1.00125 ± 0.00059 | 1.00138 ± 0.00071 | 0.1σ; 0 lost particles |
 | CE Godiva bare HEU sphere (11M active) | 1.00041 ± 0.00022 | 1.00017 ± 0.00021 | 0.8σ (Δ = −24 pcm); leakage fraction agrees to 0.9σ |
 | CE Godiva bare HEU sphere (400M active) | 1.000051 ± 0.000032 | 1.000013 ± 0.000035 | **Δ = −3.8 ± 4.7 pcm** — any residual fp32-vs-fp64 bias is within [−13, +6] pcm at 95%; leakage fraction identical (0.57310) |
+
+Lost particles are counted into the standard `n_lost_particles`
+accounting and the upstream abort thresholds apply (raise
+`max_lost_particles` in settings exactly as on the CPU if a model needs
+it). After the fp32 geometry hardening the measured residual rates are 0
+(MG lattice, Godiva) and ~2×10⁻⁶ (S(α,β) pincell).
 
 A device-vs-host ensemble discrepancy on Godiva (−630 pcm) that shipped
 in the first push was root-caused to the Metal compiler miscompiling a

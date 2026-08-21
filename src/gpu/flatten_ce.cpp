@@ -463,6 +463,11 @@ struct GpuCeFlatten {
     if (auto* ca = dynamic_cast<const CorrelatedAngleEnergy*>(ae))
       return correlated(ca);
     if (auto* nb = dynamic_cast<const NBodyPhaseSpace*>(ae)) {
+      if (nb->n_bodies_ < 3 || nb->n_bodies_ > 5) {
+        // CPU fatals on other counts; the device would sample 5-body
+        err = "N-body phase space with n_bodies outside 3..5";
+        return -1;
+      }
       int32_t hdr = (int32_t)i32_off();
       double d[3] = {nb->mass_ratio_, nb->A_, nb->Q_};
       m.i32.push_back(GPU_DIST_NBODY);
@@ -610,6 +615,10 @@ bool flatten_ce(FlatModel& m)
       } else {
         gn.total_nu_f1d = fx.f1d(frx0->products_[0].yield_.get());
       }
+      if (gn.total_nu_f1d < 0)
+        return reject_ce(
+          m, fmt::format("nuclide {}: no usable nu function ({})", nuc.name_,
+               fx.err.empty() ? "missing yield" : fx.err));
       int n_del = settings::create_delayed_neutrons ? nuc.n_precursor_ : 0;
       gn.n_delayed = (uint32_t)n_del;
 
@@ -737,6 +746,13 @@ bool flatten_ce(FlatModel& m)
       m.i32.push_back((int32_t)coff);
       m.i32.push_back((int32_t)xoff);
     }
+
+    // catch-all for helpers whose failure a call site did not check
+    // (e.g. an unsupported applicability function inside a nested law):
+    // err is sticky, so nothing unsupported can slip into the arena
+    if (!fx.err.empty())
+      return reject_ce(
+        m, fmt::format("nuclide {}: {}", nuc.name_, fx.err));
 
     m.nuclides.push_back(gn);
   }

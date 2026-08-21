@@ -163,11 +163,19 @@ DEVICE_FN GpuVec3 gpu_surf_normal(GpuGeomData g, int32_gpu i_surf, GpuVec3 r)
 }
 
 //! Distance along u to the surface; GPU_INFTY if no positive hit.
-DEVICE_FN float gpu_surf_distance(
-  GpuGeomData g, int32_gpu i_surf, GpuVec3 r, GpuVec3 u, bool coincident)
+//! on_side: 0 when not on this surface, else +1/-1 = the sense side the
+//! particle is currently on (the sign of its on-surface token).
+//! side_hint: the sense side this CELL's region expects for the surface
+//! (the region token's sign) — used only to disambiguate f == 0 exactly,
+//! where -0/ui = +0 would otherwise fabricate a zero-distance crossing in
+//! BOTH directions (fp32 corner points quantize onto planes; the resulting
+//! spurious re-reflections ping-pong until the event cap).
+DEVICE_FN float gpu_surf_distance(GpuGeomData g, int32_gpu i_surf, GpuVec3 r,
+  GpuVec3 u, int32_gpu on_side, int32_gpu side_hint)
 {
   GpuSurface s = g.surfaces[i_surf];
   GLOBAL const float* c = g.f32 + s.coeff_off;
+  bool coincident = (on_side != 0);
 
   switch (s.type) {
   case GPU_SURF_X_PLANE:
@@ -185,20 +193,32 @@ DEVICE_FN float gpu_surf_distance(
       ui = u.z;
     }
     // No coincidence band for planes: the on-surface token plus the sign
-    // of d handle every case, and an in-band particle moving toward the
-    // plane must produce a d~0 crossing so boundary conditions fire (the
-    // token flip prevents re-crossing loops). The CPU's 1e-12 band is
-    // statistically invisible at fp64; at fp32 a band leaks particles.
-    if (coincident || ui == 0.0f)
+    // of d handle every case. The token's suppression is DIRECTIONAL: an
+    // on-plane particle moving away never re-crosses (INFTY), but one
+    // moving back toward the plane must produce a d = 0 crossing so
+    // boundary conditions fire — otherwise an on-wall particle that
+    // scatters outward streams straight through the wall. The token flip
+    // at the crossing prevents re-crossing loops.
+    if (ui == 0.0f)
       return GPU_INFTY;
+    int32_gpu side = on_side;
+    if (side == 0 && f == 0.0f)
+      side = side_hint;
+    if (side != 0)
+      return ((side > 0) ? (ui < 0.0f) : (ui > 0.0f)) ? 0.0f : GPU_INFTY;
     float d = -f / ui;
     return (d < 0.0f) ? GPU_INFTY : d;
   }
   case GPU_SURF_PLANE: {
     float f = c[0] * r.x + c[1] * r.y + c[2] * r.z - c[3];
     float proj = c[0] * u.x + c[1] * u.y + c[2] * u.z;
-    if (coincident || proj == 0.0f)
+    if (proj == 0.0f)
       return GPU_INFTY;
+    int32_gpu side = on_side;
+    if (side == 0 && f == 0.0f)
+      side = side_hint;
+    if (side != 0)
+      return ((side > 0) ? (proj < 0.0f) : (proj > 0.0f)) ? 0.0f : GPU_INFTY;
     float d = -f / proj;
     return (d < 0.0f) ? GPU_INFTY : d;
   }
@@ -453,8 +473,10 @@ DEVICE_FN GpuCellDist gpu_cell_distance_nearest(GpuGeomData g,
     if (token >= GPU_OP_UNION)
       continue;
     int32_gpu abs_tok = token > 0 ? token : -token;
-    bool coincident = (abs_tok == on_abs);
-    float d = gpu_surf_distance(g, abs_tok - 1, r, u, coincident);
+    int32_gpu on_side =
+      (abs_tok == on_abs) ? ((on_surface > 0) ? 1 : -1) : 0;
+    float d = gpu_surf_distance(
+      g, abs_tok - 1, r, u, on_side, (token > 0) ? 1 : -1);
     if (ignore_coincident && d < GPU_FP_COINCIDENT)
       continue;
     if (d < out.d) {
@@ -468,7 +490,7 @@ DEVICE_FN GpuCellDist gpu_cell_distance_nearest(GpuGeomData g,
 }
 
 //! CSGCell::distance dispatch, with the complex-region virtual-crossing
-//! loop bounded at GPU_MAX_VIRTUAL_CROSSINGS (CPU loop is unbounded).
+//! loop bounded by the geometric maximum (2 crossings per quadric token).
 DEVICE_FN GpuCellDist gpu_cell_distance(
   GpuGeomData g, int32_gpu i_cell, GpuVec3 r, GpuVec3 u, int32_gpu on_surface)
 {
@@ -487,11 +509,15 @@ DEVICE_FN GpuCellDist gpu_cell_distance(
   // actually changes. Coincident hits are skipped only while actually on a
   // surface (CPU: ignore_coincident_surfaces = on_surface != 0) — dropping
   // them unconditionally would skip a genuinely-near first boundary.
+  // A quadric crosses a straight ray at most twice, so 2*n_tokens bounds
+  // the real crossings: exhausting the loop provably means no boundary
+  // (the CPU loop is unbounded but terminates for the same reason).
   bool in_region = gpu_contains_complex(g, tok, c.n_tokens, r, u, on_surface);
   float d_total = 0.0f;
   GpuVec3 rr = r;
   int32_gpu on = on_surface;
-  for (int iter = 0; iter < GPU_MAX_VIRTUAL_CROSSINGS; ++iter) {
+  int32_gpu max_iter = 2 * (int32_gpu)c.n_tokens + 4;
+  for (int32_gpu iter = 0; iter < max_iter; ++iter) {
     GpuCellDist cand =
       gpu_cell_distance_nearest(g, tok, c.n_tokens, rr, u, on, on != 0);
     if (cand.d == GPU_INFTY)
@@ -792,10 +818,13 @@ DEVICE_FN GpuBoundary gpu_distance_to_boundary(
       GpuLattice lat = g.lattices[c->lattice];
       ld = gpu_lat_distance(lat, c->r, c->u);
       d_lat = ld.d;
-      if (d_lat < 0.0f) {
-        p->lost = 1;
-        return info;
-      }
+      // fp32 flight overshoot can land the tile-local point epsilon past a
+      // face while the indices still name the old tile: the crossing has
+      // already happened physically, so take it now at d = 0 (the trans
+      // for the overshot face is already set) and let gpu_cross_lattice
+      // re-index — previously this state was marked lost
+      if (d_lat < 0.0f)
+        d_lat = 0.0f;
     }
 
     if (sd.d < d_lat - GPU_FP_COINCIDENT) {
@@ -863,12 +892,25 @@ DEVICE_FN bool gpu_cross_lattice(
 
   bool ok;
   if (!gpu_lat_valid(lat, c->li)) {
-    // The particle left the lattice. CPU (geometry.cpp cross_lattice)
-    // always re-searches from the base coords; the root descent then lands
-    // in `outer` (or the parent cell) via the normal lattice-fill logic.
-    // Searching `outer` at the tile level here would use tile-local
-    // coordinates and can mis-place the particle.
-    ok = gpu_exhaustive_find_cell(g, p, root, levels);
+    // The particle left the lattice. When the lattice has an outer
+    // universe, continue in it at the current level: the extrapolated
+    // tile frame set above is exactly the frame the normal lattice-fill
+    // descent would use for out-of-range indices, and it avoids
+    // re-deciding an on-boundary fp32 point from the root (which flips a
+    // sign coin on the crossed face and loses the particle — measured
+    // ~1e-4 of MG-lattice histories). Without an outer universe, fall
+    // back to the CPU's base-coordinate re-search (geometry.cpp
+    // cross_lattice), with a nudge retry for the on-surface point.
+    if (lat.outer != GPU_C_NONE) {
+      c->universe = lat.outer;
+      c->cell = GPU_C_NONE;
+      if (gpu_find_cell_inner(g, p, levels))
+        ok = true;
+      else
+        ok = gpu_exhaustive_find_cell(g, p, root, levels);
+    } else {
+      ok = gpu_exhaustive_find_cell(g, p, root, levels);
+    }
   } else {
     c->universe = g.i32[lat.univ_off + gpu_lat_flat(lat, c->li)];
     c->cell = GPU_C_NONE;

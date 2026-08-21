@@ -106,22 +106,32 @@ run proceeds normally on the CPU.
 
 ## Performance
 
-Active-batch calculation rates with tallies enabled, M3 Ultra (80-core
-GPU) vs the same tree's CPU build on 28 threads (solo runs):
+Active-batch calculation rates with tallies enabled on an M3 Ultra
+(80-core GPU), solo runs. **CPU baselines use each case's best measured
+thread count** — on this machine the CPU tally path scales *negatively*
+above ~8 threads (atomic contention on tally bins: Godiva with tallies
+runs 1.70M/s at 4 threads but 0.16M/s at 28), so all-cores numbers
+flatter the GPU misleadingly. An x86_64 build of the same tree running
+under Rosetta 2 is included as the migration baseline.
 
-| Case | particles/batch | CPU | GPU | Speedup |
-|---|---|---|---|---|
-| MG 7-group pin lattice | 10k | 34.7k/s | 1.23M/s | 35× |
-| MG 7-group pin lattice | 100k | 37.1k/s | 3.29M/s | 89× |
-| MG 7-group pin lattice | 1M | 39.8k/s | 3.93M/s | **99×** |
-| CE pincell (no S(a,b)) | 20k | 26.0k/s | 687k/s | 26× |
-| CE pincell (no S(a,b)) | 500k | — | 1.28M/s | ~49× |
-| CE pincell with S(a,b) | 20k | 17.1k/s | 590k/s | 35× |
-| CE Godiva (fast) | 100k | 463k/s | 5.79M/s | 12.5× |
-| CE Godiva (fast) | 1M | — | 10.8M/s | ~23× |
+| Case | particles/batch | CPU best (native arm64) | CPU best (x86_64 under Rosetta) | GPU | GPU vs native | GPU vs Rosetta |
+|---|---|---|---|---|---|---|
+| MG 7-group pin lattice | 100k | 149k/s (8t) | 115k/s (8t) | 3.11M/s | 21× | 27× |
+| MG 7-group pin lattice | 1M | ~149k/s | ~115k/s | 3.93M/s | 26× | 34× |
+| CE pincell with S(a,b) | 20k | 70k/s (4t) | 60k/s (8t) | 583k/s | 8.3× | 9.7× |
+| CE Godiva (fast) | 100k | 1.70M/s (4t) | 1.24M/s (8t) | 10.2M/s | 6.0× | 8.2× |
+| CE Godiva (fast) | 1M | ~1.70M/s | ~1.24M/s | 10.8M/s | 6.4× | 8.7× |
+
+Rosetta's translation penalty is cleanest single-threaded: native/Rosetta
+per-core throughput is 1.84× (MG), 1.37× (S(a,b) pincell), 1.37×
+(Godiva); at the multi-thread optimum the shared contention bottleneck
+partially masks it (1.16–1.37×). Rosetta runs reproduced native k
+bit-for-bit on MG and Godiva with matched seeds.
 
 GPU throughput improves with larger `particles` per batch (the GPU is
-under-occupied below ~10^5 particles in flight).
+under-occupied below ~10^5 particles in flight). Practical CPU tip
+independent of the GPU: on many-core Apple Silicon, run tallied problems
+at 4–8 OpenMP threads, not all cores.
 
 ## Architecture
 

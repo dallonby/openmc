@@ -30,7 +30,17 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    `SIZE_MAX`) and reads entries into `int`, testing `< 0`). Correct only
    through the narrowing wraparound; worth an `int32_t` cleanup upstream.
 
-3. **The event-based queue sort is dead code** (`src/event.cpp:81` —
+3. **CPU tally scoring collapses above ~8 threads on Apple Silicon**
+   (observation, not a fork change): with ~50 tally bins, Godiva runs
+   1.70M/s at 4 threads, 1.17M at 8, 0.31M at 16, 0.15M at 28 — the
+   `#pragma omp atomic` tally accumulation cache-line ping-pongs, likely
+   compounded by libomp scheduling across P+E cores. Without tallies,
+   28 threads still only reaches 0.98M/s vs 0.80M single-threaded.
+   Reported CPU baselines in README_METAL.md therefore use each case's
+   best thread count. Possibly worth per-thread tally buffers upstream on
+   many-core targets.
+
+4. **The event-based queue sort is dead code** (`src/event.cpp:81` —
    commented out pending TBB); `EventQueueItem::operator<` exists and works.
    Noted for the future event-based GPU mode, where the same sort is the
    standard divergence-reduction step.

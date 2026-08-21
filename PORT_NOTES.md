@@ -21,9 +21,10 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    `gout`), so it never produced wrong physics upstream — but any new
    caller would have hit it. The rank-4-vs-comment mismatch in
    `include/openmc/xsdata.h` (which documented chi_delayed as
-   `[angle][in][out][dg]`) is fixed on this branch too. Candidate for an
-   upstream PR; the missing rank check in `tensor::Tensor::operator()` is
-   a second hardening candidate.
+   `[angle][in][out][dg]`) is fixed on this branch too. Submitted upstream as
+   [PR #4067](https://github.com/openmc-dev/openmc/pull/4067); the missing
+   rank check in `tensor::Tensor::operator()` is a second hardening
+   candidate.
 
 2. **`Nuclide::reaction_index_` narrows `SIZE_MAX` to `int`**
    (`nuclide.cpp` fills the `array<size_t, 902>` with `C_NONE` (=-1, i.e.
@@ -54,7 +55,8 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    `density_mult` (`tally_scoring.cpp`). For any cell with a density
    multiplier ≠ 1 in MG mode, total/absorption and fission/scatter tallies
    use different densities. The GPU scores reproduce the CPU behavior
-   exactly (`gpu_mg_score_xs`).
+   exactly (`gpu_mg_score_xs`). Reported upstream as
+   [issue #4070](https://github.com/openmc-dev/openmc/issues/4070).
 
 6. **`ContinuousTabular::sample` applies the lin-lin inversion to discrete
    lines** (`distribution_energy.cpp`): after a discrete hit (`r1 < c[k]`,
@@ -62,8 +64,13 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    energy, but a lin-lin table falls into the continuous inversion with a
    *negative* `r1 - c_k`, shifting the sampled energy off the discrete
    line. The GPU sampler deliberately deviates here and returns the exact
-   line energy for any discrete hit. Reachable only for ACE tables mixing
-   discrete lines with lin-lin interpolation. Related quirk, mirrored
+   line energy for any discrete hit. A census of ENDF/B-VIII.0 found the
+   combination in 19,913 secondary-photon tables (discrete gammas of
+   (n,2n)/(n,3n)/(n,n') continuum) and zero neutron-product tables, so
+   coupled neutron-photon runs sample smeared gamma lines while
+   neutron-only results are unaffected. Reported upstream as
+   [issue #4068](https://github.com/openmc-dev/openmc/issues/4068) with
+   fix [PR #4069](https://github.com/openmc-dev/openmc/pull/4069). Related quirk, mirrored
    rather than fixed: `CorrelatedAngleEnergy::sample_dist` leaves `c_k1`
    stale (== `c_k`) when the CDF walk exhausts the last bin, so the
    nearest-CDF angle-table pick always chooses table `k+1` there.

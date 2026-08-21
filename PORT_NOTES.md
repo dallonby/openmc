@@ -121,6 +121,15 @@ the mean flight length).
 Lost particles: ~1e-4 of histories (pincell), 0 (Godiva), ~7e-6 (MG
 lattice); counted and warned per generation.
 
+Cross-ISA check of the CPU reference itself: an x86_64 build of this tree
+run under Rosetta 2 reproduces the native arm64 build **bit-for-bit** on
+Godiva (15M histories: identical k to all digits, all 57 tally bins
+exactly equal) and on the MG lattice; the S(a,b) pincell differs only by
+trajectory reshuffling from ulp-level libm differences under translation
+(dk = +79 pcm at 1.1 sigma over 3M histories, 58 bins mean z^2
+0.18-0.66). The fp64 CPU reference used for GPU validation is therefore
+instruction-set-independent.
+
 ## Open items
 
 1. **Device-arithmetic ensemble bias on leakage-dominated fast systems**

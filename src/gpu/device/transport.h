@@ -55,7 +55,7 @@ struct GpuTallyView {
   uint32_gpu n_tallies;
 };
 
-// ---- RegularMesh helpers (StructuredMesh semantics: 1-based ijk) ----
+// ---- Structured-mesh helpers (StructuredMesh semantics: 1-based ijk) ----
 DEVICE_FN int32_gpu gpu_mesh_index_dir(
   float r, float ll, float ur, float w, int32_gpu shape)
 {
@@ -66,9 +66,60 @@ DEVICE_FN int32_gpu gpu_mesh_index_dir(
   return (int32_gpu)ceilf((r - ll) / w);
 }
 
-//! get_indices: 1-based indices; returns in_mesh
-DEVICE_FN bool gpu_mesh_indices(GpuMesh m, GpuVec3 r, THREAD int32_gpu* ijk)
+//! lower_bound_index(grid,val)+1 on an explicit ascending grid of `npts`
+//! points (StructuredMesh::get_index_in_direction for non-uniform grids):
+//! 1-based cell index, 0 below the grid, npts above it.
+DEVICE_FN int32_gpu gpu_grid_index(
+  GLOBAL const float* g, int32_gpu npts, float v)
 {
+  if (v < g[0])
+    return 0;
+  if (v >= g[npts - 1])
+    return npts; // shape+1 (npts-1 cells) unless v==back handled by caller
+  int32_gpu lo = 0, hi = npts - 1;
+  while (hi - lo > 1) {
+    int32_gpu mid = (lo + hi) / 2;
+    if (v >= g[mid])
+      lo = mid;
+    else
+      hi = mid;
+  }
+  return lo + 1;
+}
+
+//! cylindrical (r,phi,z) indices in the mesh-local frame
+DEVICE_FN bool gpu_mesh_indices_cyl(
+  GpuMesh m, GpuVec3 r, GLOBAL const float* f32, THREAD int32_gpu* ijk)
+{
+  float lx = r.x - m.ox, ly = r.y - m.oy, lz = r.z - m.oz;
+  float rr = sqrtf(lx * lx + ly * ly);
+  bool in = true;
+  ijk[0] = gpu_grid_index(f32 + m.rgrid_off, m.nx + 1, rr);
+  if (ijk[0] < 1 || ijk[0] > m.nx)
+    in = false;
+  ijk[1] = 1;
+  if (!(m.full_phi && m.ny == 1)) {
+    float phi = (rr < 1.0e-8f) ? 0.0f : atan2f(ly, lx);
+    if (phi < 0.0f)
+      phi += 6.283185307179586f;
+    ijk[1] = gpu_grid_index(f32 + m.phigrid_off, m.ny + 1, phi);
+    if (ijk[1] < 1)
+      ijk[1] = m.ny; // sanitize wrap
+    if (ijk[1] > m.ny)
+      ijk[1] = 1;
+  }
+  ijk[2] = gpu_grid_index(f32 + m.zgrid_off, m.nz + 1, lz);
+  if (ijk[2] < 1 || ijk[2] > m.nz)
+    in = false;
+  return in;
+}
+
+//! get_indices: 1-based indices; returns in_mesh
+DEVICE_FN bool gpu_mesh_indices(
+  GpuMesh m, GpuVec3 r, GLOBAL const float* f32, THREAD int32_gpu* ijk)
+{
+  if (m.kind == GPU_MESH_CYLINDRICAL)
+    return gpu_mesh_indices_cyl(m, r, f32, ijk);
   bool in = true;
   ijk[0] = gpu_mesh_index_dir(r.x, m.llx, m.urx, m.wx, m.nx);
   if (ijk[0] < 1 || ijk[0] > m.nx)
@@ -86,6 +137,103 @@ DEVICE_FN bool gpu_mesh_indices(GpuMesh m, GpuVec3 r, THREAD int32_gpu* ijk)
       in = false;
   }
   return in;
+}
+
+//! find_r_crossing: distance to radial shell `shell` (local frame), > l,
+//! or GPU_INFTY. Mirrors CylindricalMesh::find_r_crossing.
+DEVICE_FN float gpu_cyl_r_cross(GpuMesh m, GLOBAL const float* f32, GpuVec3 lr,
+  GpuVec3 u, float l, int32_gpu shell)
+{
+  if (shell < 0 || shell > m.nx)
+    return GPU_INFTY;
+  float r0 = (f32 + m.rgrid_off)[shell];
+  if (r0 == 0.0f)
+    return GPU_INFTY;
+  float denom = u.x * u.x + u.y * u.y;
+  if (denom < 1.0e-12f)
+    return GPU_INFTY;
+  float inv = 1.0f / denom;
+  float p = (u.x * lr.x + u.y * lr.y) * inv;
+  float R = sqrtf(lr.x * lr.x + lr.y * lr.y);
+  float D = p * p - (R - r0) * (R + r0) * inv;
+  if (D < 0.0f)
+    return GPU_INFTY;
+  D = sqrtf(D);
+  if (fabsf(R - r0) <= 1.0e-6f * (1.0f + fabsf(r0)))
+    return GPU_INFTY;
+  if (-p - D > l)
+    return -p - D;
+  if (-p + D > l)
+    return -p + D;
+  return GPU_INFTY;
+}
+
+//! find_phi_crossing (local frame). Mirrors CylindricalMesh::find_phi_crossing.
+DEVICE_FN float gpu_cyl_phi_cross(GpuMesh m, GLOBAL const float* f32,
+  GpuVec3 lr, GpuVec3 u, float l, int32_gpu shell)
+{
+  if (m.full_phi && m.ny == 1)
+    return GPU_INFTY;
+  // phi grid has ny+1 points [0..ny]; CPU indexes grid_[1][shell] after
+  // sanitize (shell wraps into [0,ny])
+  int32_gpu idx = shell;
+  if (idx < 0)
+    idx = m.ny;
+  if (idx > m.ny)
+    idx = 0;
+  float p0 = (f32 + m.phigrid_off)[idx];
+  float c0 = cosf(p0), s0 = sinf(p0);
+  float denom = (u.x * s0 - u.y * c0);
+  if (fabsf(denom) > 1.0e-8f) {
+    float sdist = -(lr.x * s0 - lr.y * c0) / denom;
+    if ((sdist > l) &&
+        ((c0 * (lr.x + sdist * u.x) + s0 * (lr.y + sdist * u.y)) > 0.0f))
+      return sdist;
+  }
+  return GPU_INFTY;
+}
+
+//! cylindrical distance to next grid boundary in axis k (from local start),
+//! writing the next index. l = distance already traveled along the track.
+DEVICE_FN float gpu_mesh_dist_cyl(GpuMesh m, GLOBAL const float* f32,
+  THREAD const int32_gpu* ijk, int k, GpuVec3 r0, GpuVec3 u, float l,
+  THREAD int32_gpu* next)
+{
+  GpuVec3 lr = gpu_v3(r0.x - m.ox, r0.y - m.oy, r0.z - m.oz);
+  if (k == 0) {
+    float d_out = gpu_cyl_r_cross(m, f32, lr, u, l, ijk[0]);
+    float d_in = gpu_cyl_r_cross(m, f32, lr, u, l, ijk[0] - 1);
+    if (d_in < d_out) {
+      *next = ijk[0] - 1;
+      return d_in;
+    }
+    *next = ijk[0] + 1;
+    return d_out;
+  } else if (k == 1) {
+    float d_up = gpu_cyl_phi_cross(m, f32, lr, u, l, ijk[1]);
+    float d_dn = gpu_cyl_phi_cross(m, f32, lr, u, l, ijk[1] - 1);
+    if (d_dn < d_up) {
+      int32_gpu nx = ijk[1] - 1;
+      *next = (nx < 1) ? m.ny : nx;
+      return d_dn;
+    }
+    int32_gpu nx = ijk[1] + 1;
+    *next = (nx > m.ny) ? 1 : nx;
+    return d_up;
+  } else {
+    *next = ijk[2];
+    if (fabsf(u.z) < 1.0e-8f)
+      return GPU_INFTY;
+    GLOBAL const float* zg = f32 + m.zgrid_off;
+    if (u.z > 0.0f && ijk[2] <= m.nz) {
+      *next = ijk[2] + 1;
+      return (zg[ijk[2]] - lr.z) / u.z;
+    } else if (u.z < 0.0f && ijk[2] > 0) {
+      *next = ijk[2] - 1;
+      return (zg[ijk[2] - 1] - lr.z) / u.z;
+    }
+    return GPU_INFTY;
+  }
 }
 
 DEVICE_FN int32_gpu gpu_mesh_bin(GpuMesh m, THREAD const int32_gpu* ijk)
@@ -114,11 +262,14 @@ DEVICE_FN float gpu_vec_comp(GpuVec3 v, int k)
   return k == 0 ? v.x : (k == 1 ? v.y : v.z);
 }
 
-//! RegularMesh::distance_to_grid_boundary (distance measured from the track
-//! start r0, as on the CPU); returns distance, writes next index
-DEVICE_FN float gpu_mesh_dist(GpuMesh m, THREAD const int32_gpu* ijk, int k,
-  GpuVec3 r0, GpuVec3 u, THREAD int32_gpu* next)
+//! distance_to_grid_boundary (distance measured from the track start r0, as
+//! on the CPU); returns distance, writes next index. l = already-traveled.
+DEVICE_FN float gpu_mesh_dist(GpuMesh m, GLOBAL const float* f32,
+  THREAD const int32_gpu* ijk, int k, GpuVec3 r0, GpuVec3 u, float l,
+  THREAD int32_gpu* next)
 {
+  if (m.kind == GPU_MESH_CYLINDRICAL)
+    return gpu_mesh_dist_cyl(m, f32, ijk, k, r0, u, l, next);
   *next = ijk[k];
   float uk = gpu_vec_comp(u, k);
   if (uk == 0.0f)
@@ -194,7 +345,7 @@ DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
     // gpu_score_tallies instead.
     GpuMesh mesh = tv.meshes[f.mesh];
     int32_gpu ijk[3];
-    if (!gpu_mesh_indices(mesh, gs->coord[0].r, ijk))
+    if (!gpu_mesh_indices(mesh, gs->coord[0].r, tv.f32, ijk))
       return 0;
     bins[0] = gpu_mesh_bin(mesh, ijk);
     return 1;
@@ -307,7 +458,7 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
       continue;
     int32_gpu ijk[3];
     bool in_mesh = gpu_mesh_indices(
-      m, gpu_add(r0, gpu_scale(u, GPU_TINY_BIT)), ijk);
+      m, gpu_add(r0, gpu_scale(u, GPU_TINY_BIT)), tv.f32, ijk);
     if (total < 2.0f * GPU_TINY_BIT) {
       if (in_mesh) {
         fbins[mesh_fi * GPU_MAX_COORD] = gpu_mesh_bin(m, ijk);
@@ -319,7 +470,7 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
     int32_gpu nk[3];
     int nd = m.n_dim;
     for (int k = 0; k < nd; ++k)
-      dk[k] = gpu_mesh_dist(m, ijk, k, r0, u, &nk[k]);
+      dk[k] = gpu_mesh_dist(m, tv.f32, ijk, k, r0, u, 0.0f, &nk[k]);
     float traveled = 0.0f;
     int32_gpu guard = 4 * (m.nx + m.ny + m.nz) + 16;
     while (guard-- > 0) {
@@ -339,7 +490,7 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
         if (traveled >= total)
           break;
         ijk[kmin] = nk[kmin];
-        dk[kmin] = gpu_mesh_dist(m, ijk, kmin, r0, u, &nk[kmin]);
+        dk[kmin] = gpu_mesh_dist(m, tv.f32, ijk, kmin, r0, u, traveled, &nk[kmin]);
         in_mesh = (ijk[kmin] >= 1 && ijk[kmin] <= gpu_mesh_shape(m, kmin));
       } else {
         int kmax = -1;
@@ -355,9 +506,9 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
         if (traveled >= total)
           break;
         in_mesh = gpu_mesh_indices(
-          m, gpu_add(r0, gpu_scale(u, traveled + GPU_TINY_BIT)), ijk);
+          m, gpu_add(r0, gpu_scale(u, traveled + GPU_TINY_BIT)), tv.f32, ijk);
         for (int k = 0; k < nd; ++k)
-          dk[k] = gpu_mesh_dist(m, ijk, k, r0, u, &nk[k]);
+          dk[k] = gpu_mesh_dist(m, tv.f32, ijk, k, r0, u, traveled, &nk[k]);
       }
     }
   }
@@ -386,7 +537,7 @@ struct GpuBanks {
   GLOBAL GpuSourceSite* fission;
   GLOBAL gpu_atomic_u32* counters;
   GLOBAL uint32_gpu* progeny;
-  GLOBAL gpu_atomic_f32* red_slots; // [ceil(n/256)][GPU_RED_WIDTH]
+  GLOBAL float* red_slots; // [n_particles][GPU_RED_WIDTH], no atomics
   GLOBAL GpuTraceRec* trace;        // debug event trace (id-gated)
 };
 
@@ -1287,15 +1438,19 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   }
 
   // ---- event_death ----
-  uint32_gpu slot = (tid >> 8) * GPU_RED_WIDTH;
-  if (k_tl != 0.0f)
-    gpu_atomic_add_f(banks.red_slots + slot + GPU_RED_K_TRACKLENGTH, k_tl);
-  if (k_col != 0.0f)
-    gpu_atomic_add_f(banks.red_slots + slot + GPU_RED_K_COLLISION, k_col);
-  if (k_abs != 0.0f)
-    gpu_atomic_add_f(banks.red_slots + slot + GPU_RED_K_ABSORPTION, k_abs);
-  if (k_leak != 0.0f)
-    gpu_atomic_add_f(banks.red_slots + slot + GPU_RED_LEAKAGE, k_leak);
+  // keff estimators are written to this particle's OWN slot (no atomics) and
+  // summed on the host in fp64 in index order. Atomic accumulation here was
+  // order-dependent, and because simulation::keff feeds back into the next
+  // generation's fission-site count (nu_t = wgt/keff * nu_f/total), a 1-ulp
+  // difference eventually flips one particle's nu and the whole run diverges:
+  // measured as a bimodal MG k (1.34172 / 1.34121) with the two runs
+  // bit-identical for 82 batches before splitting. Per-particle slots make
+  // the reduction deterministic (and remove 4 atomics per history).
+  uint32_gpu slot = tid * GPU_RED_WIDTH;
+  banks.red_slots[slot + GPU_RED_K_TRACKLENGTH] = k_tl;
+  banks.red_slots[slot + GPU_RED_K_COLLISION] = k_col;
+  banks.red_slots[slot + GPU_RED_K_ABSORPTION] = k_abs;
+  banks.red_slots[slot + GPU_RED_LEAKAGE] = k_leak;
   // progeny count with the leak flag in the top bit (debug diagnostics)
   banks.progeny[ctl.source_offset + tid] =
     (uint32_gpu)n_progeny | (leaked << 31);

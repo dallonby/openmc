@@ -418,7 +418,7 @@ void try_initialize()
 
   // dynamic buffers
   int64_t n = simulation::work_per_rank;
-  eng.n_red_slots = (uint32_t)((n + 255) / 256);
+  eng.n_red_slots = (uint32_t)n; // one slot group per particle
   // replicated tally banks: enough that per-bank per-batch sums stay far
   // from the fp32 integer boundary (2^24), capped at 128 MB of banks
   eng.tally_replicas = 64;
@@ -1183,6 +1183,40 @@ void transport_generation()
       static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_PROGENY));
     for (int64_t i = 0; i < n; ++i)
       simulation::progeny_per_particle[i] = prog[i] & 0x7fffffffu;
+    if (std::getenv("OPENMC_GPU_BANKCHECK")) {
+      // sort_bank permutes by progeny_per_particle[parent]+progeny_id; that
+      // is only a bijection if the counts match the banked sites exactly
+      uint64_t sum = 0;
+      for (int64_t i = 0; i < n; ++i)
+        sum += simulation::progeny_per_particle[i];
+      std::vector<uint8_t> hit(n_sites, 0);
+      std::vector<uint64_t> scan(n, 0);
+      uint64_t acc = 0;
+      for (int64_t i = 0; i < n; ++i) {
+        scan[i] = acc;
+        acc += simulation::progeny_per_particle[i];
+      }
+      uint32_t dup = 0, oob = 0;
+      for (uint32_t i = 0; i < n_sites; ++i) {
+        const GpuSourceSite& g = fb[i];
+        uint64_t idx = scan[g.parent_id] + g.progeny_id;
+        if (idx >= n_sites) {
+          ++oob;
+          continue;
+        }
+        if (hit[idx]++)
+          ++dup;
+      }
+      uint32_t unwritten = 0;
+      for (uint32_t i = 0; i < n_sites; ++i)
+        if (!hit[i])
+          ++unwritten;
+      if (sum != n_sites || dup || oob || unwritten)
+        std::fprintf(stderr,
+          "[bankcheck] MISMATCH sum(progeny)=%llu n_sites=%u dup=%u oob=%u "
+          "unwritten=%u\n",
+          (unsigned long long)sum, n_sites, dup, oob, unwritten);
+    }
   }
   auto* prog =
     static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_PROGENY));
@@ -1199,10 +1233,30 @@ void transport_generation()
   // ---- keff estimator reduction (fp32 slots -> fp64 globals) ----
   auto* red =
     static_cast<float*>(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS));
+  // Deterministic fp64 reduction: fixed chunk partition, each chunk summed
+  // in index order, chunk results combined in index order — identical
+  // result for any thread count (and run to run).
   double sums[GPU_RED_WIDTH] = {};
-  for (uint32_t s = 0; s < eng.n_red_slots; ++s)
-    for (int k = 0; k < GPU_RED_WIDTH; ++k)
-      sums[k] += red[s * GPU_RED_WIDTH + k];
+  {
+    const int64_t n_slots = (int64_t)eng.n_red_slots;
+    const int64_t chunk = 8192;
+    const int64_t n_chunks = (n_slots + chunk - 1) / chunk;
+    std::vector<double> part((size_t)n_chunks * GPU_RED_WIDTH, 0.0);
+#pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < n_chunks; ++c) {
+      double acc[GPU_RED_WIDTH] = {};
+      const int64_t lo = c * chunk;
+      const int64_t hi = std::min(lo + chunk, n_slots);
+      for (int64_t i = lo; i < hi; ++i)
+        for (int k = 0; k < GPU_RED_WIDTH; ++k)
+          acc[k] += red[i * GPU_RED_WIDTH + k];
+      for (int k = 0; k < GPU_RED_WIDTH; ++k)
+        part[(size_t)c * GPU_RED_WIDTH + k] = acc[k];
+    }
+    for (int64_t c = 0; c < n_chunks; ++c)
+      for (int k = 0; k < GPU_RED_WIDTH; ++k)
+        sums[k] += part[(size_t)c * GPU_RED_WIDTH + k];
+  }
   global_tally_tracklength += sums[GPU_RED_K_TRACKLENGTH];
   global_tally_collision += sums[GPU_RED_K_COLLISION];
   global_tally_absorption += sums[GPU_RED_K_ABSORPTION];

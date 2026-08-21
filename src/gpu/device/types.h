@@ -181,12 +181,23 @@ struct GpuFilterDesc {
   int32_gpu mesh;     // mesh filter: index into meshes array, else -1
 };
 
-struct GpuMesh { // RegularMesh, untranslated/unrotated (flatten rejects others)
-  int32_gpu n_dim;      // 1..3 (bin layout follows StructuredMesh::get_bin_from_indices)
-  int32_gpu nx, ny, nz; // shape (1 for unused dimensions)
+#define GPU_MESH_REGULAR 0
+#define GPU_MESH_CYLINDRICAL 1
+
+struct GpuMesh { // untranslated/unrotated (flatten rejects those)
+  int32_gpu kind;       // GPU_MESH_REGULAR | GPU_MESH_CYLINDRICAL
+  int32_gpu n_dim;      // 1..3 (bin layout: StructuredMesh::get_bin_from_indices)
+  int32_gpu nx, ny, nz; // shape (# cells per axis; 1 for unused dimensions)
+  // --- regular (uniform) ---
   float llx, lly, llz;  // lower_left
-  float urx, ury, urz;  // upper_right (cast from fp64; edge rules compare to it)
+  float urx, ury, urz;  // upper_right (fp32 cast; edge rules compare to it)
   float wx, wy, wz;     // element width
+  // --- cylindrical (explicit r/phi/z grids) ---
+  float ox, oy, oz;     // origin
+  uint32_gpu rgrid_off;   // f32 arena: nx+1 radial edges
+  uint32_gpu phigrid_off; // f32 arena: ny+1 azimuthal edges (radians)
+  uint32_gpu zgrid_off;   // f32 arena: nz+1 axial edges
+  int32_gpu full_phi;     // 1 if phi grid spans [0,2pi]
 };
 
 // Filters per tally are bounded so the device can enumerate every

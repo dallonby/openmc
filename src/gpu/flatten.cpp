@@ -562,37 +562,62 @@ bool flatten_tallies(FlatModel& m)
             fmt::format("tally {} has a translated/rotated mesh filter "
                         "(unsupported in GPU v1)",
               t->id()));
-        const auto* rm =
-          dynamic_cast<const RegularMesh*>(model::meshes[mf->mesh()].get());
-        if (!rm)
-          return reject(m,
-            fmt::format("tally {} uses a non-regular mesh (unsupported in "
-                        "GPU v1)",
-              t->id()));
+        const Mesh* msh = model::meshes[mf->mesh()].get();
         GpuMesh gm {};
-        gm.n_dim = rm->n_dimension_;
-        int sh[3] = {1, 1, 1};
-        double ll[3] = {0, 0, 0}, ur[3] = {0, 0, 0}, w[3] = {1, 1, 1};
-        for (int k = 0; k < gm.n_dim; ++k) {
-          sh[k] = rm->shape_[k];
-          ll[k] = rm->lower_left_[k];
-          ur[k] = rm->upper_right_[k];
-          w[k] = rm->width_[k];
+        if (const auto* rm = dynamic_cast<const RegularMesh*>(msh)) {
+          gm.kind = GPU_MESH_REGULAR;
+          gm.n_dim = rm->n_dimension_;
+          int sh[3] = {1, 1, 1};
+          double ll[3] = {0, 0, 0}, ur[3] = {0, 0, 0}, w[3] = {1, 1, 1};
+          for (int k = 0; k < gm.n_dim; ++k) {
+            sh[k] = rm->shape_[k];
+            ll[k] = rm->lower_left_[k];
+            ur[k] = rm->upper_right_[k];
+            w[k] = rm->width_[k];
+          }
+          gm.nx = sh[0];
+          gm.ny = sh[1];
+          gm.nz = sh[2];
+          gm.llx = (float)ll[0];
+          gm.lly = (float)ll[1];
+          gm.llz = (float)ll[2];
+          gm.urx = (float)ur[0];
+          gm.ury = (float)ur[1];
+          gm.urz = (float)ur[2];
+          gm.wx = (float)w[0];
+          gm.wy = (float)w[1];
+          gm.wz = (float)w[2];
+        } else if (const auto* cm = dynamic_cast<const CylindricalMesh*>(msh)) {
+          // r/phi/z explicit grids into the f32 arena
+          gm.kind = GPU_MESH_CYLINDRICAL;
+          gm.n_dim = 3;
+          gm.nx = cm->get_shape_tensor()[0];
+          gm.ny = cm->get_shape_tensor()[1];
+          gm.nz = cm->get_shape_tensor()[2];
+          gm.ox = (float)cm->origin()[0];
+          gm.oy = (float)cm->origin()[1];
+          gm.oz = (float)cm->origin()[2];
+          gm.full_phi = cm->full_phi() ? 1 : 0;
+          auto push_grid = [&](int axis, int npts) -> uint32_t {
+            uint32_t off = (uint32_t)m.f32.size();
+            for (int i = 0; i < npts; ++i) {
+              double g = axis == 0 ? cm->r(i) : (axis == 1 ? cm->phi(i)
+                                                           : cm->z(i));
+              m.f32.push_back((float)g);
+            }
+            return off;
+          };
+          gm.rgrid_off = push_grid(0, gm.nx + 1);
+          gm.phigrid_off = push_grid(1, gm.ny + 1);
+          gm.zgrid_off = push_grid(2, gm.nz + 1);
+        } else {
+          return reject(m,
+            fmt::format("tally {} uses a mesh type outside the GPU envelope "
+                        "(regular and cylindrical are supported)",
+              t->id()));
         }
-        gm.nx = sh[0];
-        gm.ny = sh[1];
-        gm.nz = sh[2];
-        gm.llx = (float)ll[0];
-        gm.lly = (float)ll[1];
-        gm.llz = (float)ll[2];
-        gm.urx = (float)ur[0];
-        gm.ury = (float)ur[1];
-        gm.urz = (float)ur[2];
-        gm.wx = (float)w[0];
-        gm.wy = (float)w[1];
-        gm.wz = (float)w[2];
         fd.type = GPU_FILTER_MESH;
-        fd.n_bins = (uint32_t)(sh[0] * sh[1] * sh[2]);
+        fd.n_bins = (uint32_t)(gm.nx * gm.ny * gm.nz);
         fd.mesh = (int32_t)m.meshes.size();
         m.meshes.push_back(gm);
       } else {

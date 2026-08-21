@@ -613,6 +613,9 @@ public:
   double r(int i) const { return grid_[0][i]; }
   double phi(int i) const { return grid_[1][i]; }
   double z(int i) const { return grid_[2][i]; }
+  //! Read-only accessors used by the GPU mesh flattener
+  const Position& origin() const { return origin_; }
+  bool full_phi() const { return full_phi_; }
 
   int set_grid();
 

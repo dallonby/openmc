@@ -49,6 +49,18 @@ struct FlatModel {
   uint32_t mg_default_iv_off {0};
   uint32_t surf_adj_off {0};
 
+  // weight windows (fixed-source variance reduction); ww_mesh < 0 = disabled
+  int32_t ww_mesh {-1};
+  uint32_t ww_n_energy {1};
+  uint32_t ww_ebounds_off {0};
+  uint32_t ww_lower_off {0};
+  uint32_t ww_upper_off {0};
+  uint32_t ww_n_mesh_bins {0};
+  double ww_survival_ratio {0.5};
+  double ww_max_lb_ratio {1.0};
+  double ww_weight_cutoff {1.0e-38};
+  int32_t ww_max_split {10};
+
   //! empty when the model flattened cleanly; otherwise names the first
   //! unsupported feature (the engine then stays inactive)
   std::string reject_reason;

@@ -501,6 +501,27 @@ void transport_generation()
   ctl->tally_accum_stride = eng.flat.tally_accum_size;
   ctl->tally_replicas = eng.tally_replicas;
   ctl->surf_adj_off = eng.flat.surf_adj_off;
+  // variance reduction (fixed-source only; flatten enforces that)
+  ctl->survival_biasing = settings::survival_biasing ? 1u : 0u;
+  ctl->weight_cutoff = (float)settings::weight_cutoff;
+  ctl->weight_survive = (float)settings::weight_survive;
+  ctl->ww_on = (eng.flat.ww_mesh >= 0) ? 1u : 0u;
+  ctl->ww_mesh = eng.flat.ww_mesh;
+  ctl->ww_n_energy = eng.flat.ww_n_energy;
+  ctl->ww_ebounds_off = eng.flat.ww_ebounds_off;
+  ctl->ww_lower_off = eng.flat.ww_lower_off;
+  ctl->ww_upper_off = eng.flat.ww_upper_off;
+  ctl->ww_n_mesh_bins = eng.flat.ww_n_mesh_bins;
+  ctl->ww_survival_ratio = (float)eng.flat.ww_survival_ratio;
+  ctl->ww_max_lb_ratio = (float)eng.flat.ww_max_lb_ratio;
+  ctl->ww_weight_cutoff = (float)eng.flat.ww_weight_cutoff;
+  ctl->ww_max_split = eng.flat.ww_max_split;
+  ctl->ww_max_history_splits = (int32_t)settings::max_history_splits;
+  ctl->ww_checkpoint_collision =
+    settings::weight_window_checkpoint_collision ? 1u : 0u;
+  ctl->ww_checkpoint_surface =
+    settings::weight_window_checkpoint_surface ? 1u : 0u;
+  ctl->spill_cap = ctl->fission_bank_cap;
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -528,6 +549,10 @@ void transport_generation()
     g.delayed_group = s.delayed_group;
     g.parent_id = 0;
     g.progeny_id = 0;
+    g.wgt_born = (float)s.wgt;
+    g.wgt_ww_born = -1.0f; // unset: the first window lookup fixes it
+    g.ww_factor = 0.0f;
+    g.n_split = 0;
   };
   // Fixed-source sites do not depend on transport results, so the NEXT
   // generation's sites are sampled while this generation's kernel runs
@@ -1097,6 +1122,77 @@ void transport_generation()
     fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
   }
   eng.gpu_seconds += omg_metal_last_time(eng.ctx);
+
+  // Deterministic fp64 reduction of the per-particle keff slots: fixed chunk
+  // partition, each chunk summed in index order, chunks combined in index
+  // order — identical for any thread count and run to run. Runs once per
+  // dispatch because the slots are indexed by thread id.
+  auto reduce_keff = [&](int64_t n_slots) {
+    auto* red =
+      static_cast<float*>(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS));
+    double sums[GPU_RED_WIDTH] = {};
+    const int64_t chunk = 8192;
+    const int64_t n_chunks = (n_slots + chunk - 1) / chunk;
+    std::vector<double> part((size_t)n_chunks * GPU_RED_WIDTH, 0.0);
+#pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < n_chunks; ++c) {
+      double acc[GPU_RED_WIDTH] = {};
+      const int64_t lo = c * chunk;
+      const int64_t hi = std::min(lo + chunk, n_slots);
+      for (int64_t i = lo; i < hi; ++i)
+        for (int k = 0; k < GPU_RED_WIDTH; ++k)
+          acc[k] += red[i * GPU_RED_WIDTH + k];
+      for (int k = 0; k < GPU_RED_WIDTH; ++k)
+        part[(size_t)c * GPU_RED_WIDTH + k] = acc[k];
+    }
+    for (int64_t c = 0; c < n_chunks; ++c)
+      for (int k = 0; k < GPU_RED_WIDTH; ++k)
+        sums[k] += part[(size_t)c * GPU_RED_WIDTH + k];
+    global_tally_tracklength += sums[GPU_RED_K_TRACKLENGTH];
+    global_tally_collision += sums[GPU_RED_K_COLLISION];
+    global_tally_absorption += sums[GPU_RED_K_ABSORPTION];
+    global_tally_leakage += sums[GPU_RED_LEAKAGE];
+  };
+  reduce_keff((int64_t)ctl->n_particles);
+
+  // ---- spill drain: weight-window splits and (n,xn) clones that did not
+  // fit in a thread's local stack were banked globally; re-dispatch them
+  // until the bank drains. Tally accumulators and keff totals accumulate
+  // across passes, so the result is the same as if every secondary had been
+  // transported in the first pass.
+  {
+    auto* ctr0 =
+      static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
+    const int max_passes = 256;
+    for (int pass = 0; pass < max_passes; ++pass) {
+      uint32_t spill = ctr0[GPU_CTR_SPILL];
+      if (spill == 0)
+        break;
+      uint32_t take = std::min(spill, ctl->spill_cap);
+      auto* spill_bank = static_cast<GpuSourceSite*>(
+        omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
+      auto* src_buf = static_cast<GpuSourceSite*>(
+        omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
+      std::memcpy(src_buf, spill_bank, (size_t)take * sizeof(GpuSourceSite));
+      ctr0[GPU_CTR_SPILL] = 0;
+      ctl->n_particles = take;
+      ctl->source_offset = 0;
+      std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS), 0,
+        (size_t)take * GPU_RED_WIDTH * 4);
+      if (omg_metal_dispatch_async(
+            eng.ctx, "openmc_transport", take, err, sizeof(err)) ||
+          omg_metal_wait(eng.ctx, err, sizeof(err))) {
+        fatal_error(fmt::format("GPU spill dispatch failed: {}", err));
+      }
+      eng.gpu_seconds += omg_metal_last_time(eng.ctx);
+      reduce_keff((int64_t)take);
+      if (pass == max_passes - 1 && ctr0[GPU_CTR_SPILL] > 0)
+        warning(fmt::format(
+          "GPU variance reduction hit the {}-pass spill limit; {} secondaries "
+          "were not transported",
+          max_passes, ctr0[GPU_CTR_SPILL]));
+    }
+  }
   auto t_gen2 = std::chrono::steady_clock::now();
 
   // ---- counters ----
@@ -1144,6 +1240,12 @@ void transport_generation()
           settings::rel_max_lost_particles * n_sim) {
       fatal_error("Maximum number of lost particles has been reached.");
     }
+  }
+  if (ctr[GPU_CTR_SPILL_DROP] > 0) {
+    warning(fmt::format(
+      "GPU dropped {} secondaries: the spill bank ({} sites) was full. "
+      "Increase it or soften the weight windows.",
+      ctr[GPU_CTR_SPILL_DROP], ctl->spill_cap));
   }
   if (ctr[GPU_CTR_SECONDARY_BANK] > 0) {
     // The CPU never drops (n,xn) clones (dynamically sized secondary
@@ -1230,37 +1332,6 @@ void transport_generation()
     std::fclose(f);
   }
 
-  // ---- keff estimator reduction (fp32 slots -> fp64 globals) ----
-  auto* red =
-    static_cast<float*>(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS));
-  // Deterministic fp64 reduction: fixed chunk partition, each chunk summed
-  // in index order, chunk results combined in index order — identical
-  // result for any thread count (and run to run).
-  double sums[GPU_RED_WIDTH] = {};
-  {
-    const int64_t n_slots = (int64_t)eng.n_red_slots;
-    const int64_t chunk = 8192;
-    const int64_t n_chunks = (n_slots + chunk - 1) / chunk;
-    std::vector<double> part((size_t)n_chunks * GPU_RED_WIDTH, 0.0);
-#pragma omp parallel for schedule(static)
-    for (int64_t c = 0; c < n_chunks; ++c) {
-      double acc[GPU_RED_WIDTH] = {};
-      const int64_t lo = c * chunk;
-      const int64_t hi = std::min(lo + chunk, n_slots);
-      for (int64_t i = lo; i < hi; ++i)
-        for (int k = 0; k < GPU_RED_WIDTH; ++k)
-          acc[k] += red[i * GPU_RED_WIDTH + k];
-      for (int k = 0; k < GPU_RED_WIDTH; ++k)
-        part[(size_t)c * GPU_RED_WIDTH + k] = acc[k];
-    }
-    for (int64_t c = 0; c < n_chunks; ++c)
-      for (int k = 0; k < GPU_RED_WIDTH; ++k)
-        sums[k] += part[(size_t)c * GPU_RED_WIDTH + k];
-  }
-  global_tally_tracklength += sums[GPU_RED_K_TRACKLENGTH];
-  global_tally_collision += sums[GPU_RED_K_COLLISION];
-  global_tally_absorption += sums[GPU_RED_K_ABSORPTION];
-  global_tally_leakage += sums[GPU_RED_LEAKAGE];
 
   // ---- tally results (fp32 batch bins -> fp64 running VALUE) ----
   if (ctl->n_tallies > 0) {

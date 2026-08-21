@@ -24,6 +24,7 @@
 #include "openmc/tallies/filter_material.h"
 #include "openmc/tallies/filter_mesh.h"
 #include "openmc/mesh.h"
+#include "openmc/weight_windows.h"
 #include "openmc/tallies/filter_universe.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/universe.h"
@@ -476,6 +477,64 @@ bool flatten_mg(FlatModel& m)
 
 } // namespace
 
+//! Flatten one structured mesh (regular or cylindrical) into `gm`, pushing
+//! any explicit grids into the f32 arena. Returns false for unsupported
+//! mesh types. Shared by tally mesh filters and the weight-window mesh.
+bool flatten_mesh(FlatModel& m, const Mesh* msh, GpuMesh& gm)
+{
+  if (const auto* rm = dynamic_cast<const RegularMesh*>(msh)) {
+    gm.kind = GPU_MESH_REGULAR;
+    gm.n_dim = rm->n_dimension_;
+    int sh[3] = {1, 1, 1};
+    double ll[3] = {0, 0, 0}, ur[3] = {0, 0, 0}, w[3] = {1, 1, 1};
+    for (int k = 0; k < gm.n_dim; ++k) {
+      sh[k] = rm->shape_[k];
+      ll[k] = rm->lower_left_[k];
+      ur[k] = rm->upper_right_[k];
+      w[k] = rm->width_[k];
+    }
+    gm.nx = sh[0];
+    gm.ny = sh[1];
+    gm.nz = sh[2];
+    gm.llx = (float)ll[0];
+    gm.lly = (float)ll[1];
+    gm.llz = (float)ll[2];
+    gm.urx = (float)ur[0];
+    gm.ury = (float)ur[1];
+    gm.urz = (float)ur[2];
+    gm.wx = (float)w[0];
+    gm.wy = (float)w[1];
+    gm.wz = (float)w[2];
+  } else if (const auto* cm = dynamic_cast<const CylindricalMesh*>(msh)) {
+    // r/phi/z explicit grids into the f32 arena
+    gm.kind = GPU_MESH_CYLINDRICAL;
+    gm.n_dim = 3;
+    gm.nx = cm->get_shape_tensor()[0];
+    gm.ny = cm->get_shape_tensor()[1];
+    gm.nz = cm->get_shape_tensor()[2];
+    gm.ox = (float)cm->origin()[0];
+    gm.oy = (float)cm->origin()[1];
+    gm.oz = (float)cm->origin()[2];
+    gm.full_phi = cm->full_phi() ? 1 : 0;
+    auto push_grid = [&](int axis, int npts) -> uint32_t {
+      uint32_t off = (uint32_t)m.f32.size();
+      for (int i = 0; i < npts; ++i) {
+        double g = axis == 0 ? cm->r(i) : (axis == 1 ? cm->phi(i)
+                                                     : cm->z(i));
+        m.f32.push_back((float)g);
+      }
+      return off;
+    };
+    gm.rgrid_off = push_grid(0, gm.nx + 1);
+    gm.phigrid_off = push_grid(1, gm.ny + 1);
+    gm.zgrid_off = push_grid(2, gm.nz + 1);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+
 bool flatten_tallies(FlatModel& m)
 {
   m.tallies.clear();
@@ -564,58 +623,11 @@ bool flatten_tallies(FlatModel& m)
               t->id()));
         const Mesh* msh = model::meshes[mf->mesh()].get();
         GpuMesh gm {};
-        if (const auto* rm = dynamic_cast<const RegularMesh*>(msh)) {
-          gm.kind = GPU_MESH_REGULAR;
-          gm.n_dim = rm->n_dimension_;
-          int sh[3] = {1, 1, 1};
-          double ll[3] = {0, 0, 0}, ur[3] = {0, 0, 0}, w[3] = {1, 1, 1};
-          for (int k = 0; k < gm.n_dim; ++k) {
-            sh[k] = rm->shape_[k];
-            ll[k] = rm->lower_left_[k];
-            ur[k] = rm->upper_right_[k];
-            w[k] = rm->width_[k];
-          }
-          gm.nx = sh[0];
-          gm.ny = sh[1];
-          gm.nz = sh[2];
-          gm.llx = (float)ll[0];
-          gm.lly = (float)ll[1];
-          gm.llz = (float)ll[2];
-          gm.urx = (float)ur[0];
-          gm.ury = (float)ur[1];
-          gm.urz = (float)ur[2];
-          gm.wx = (float)w[0];
-          gm.wy = (float)w[1];
-          gm.wz = (float)w[2];
-        } else if (const auto* cm = dynamic_cast<const CylindricalMesh*>(msh)) {
-          // r/phi/z explicit grids into the f32 arena
-          gm.kind = GPU_MESH_CYLINDRICAL;
-          gm.n_dim = 3;
-          gm.nx = cm->get_shape_tensor()[0];
-          gm.ny = cm->get_shape_tensor()[1];
-          gm.nz = cm->get_shape_tensor()[2];
-          gm.ox = (float)cm->origin()[0];
-          gm.oy = (float)cm->origin()[1];
-          gm.oz = (float)cm->origin()[2];
-          gm.full_phi = cm->full_phi() ? 1 : 0;
-          auto push_grid = [&](int axis, int npts) -> uint32_t {
-            uint32_t off = (uint32_t)m.f32.size();
-            for (int i = 0; i < npts; ++i) {
-              double g = axis == 0 ? cm->r(i) : (axis == 1 ? cm->phi(i)
-                                                           : cm->z(i));
-              m.f32.push_back((float)g);
-            }
-            return off;
-          };
-          gm.rgrid_off = push_grid(0, gm.nx + 1);
-          gm.phigrid_off = push_grid(1, gm.ny + 1);
-          gm.zgrid_off = push_grid(2, gm.nz + 1);
-        } else {
+        if (!flatten_mesh(m, msh, gm))
           return reject(m,
             fmt::format("tally {} uses a mesh type outside the GPU envelope "
                         "(regular and cylindrical are supported)",
               t->id()));
-        }
         fd.type = GPU_FILTER_MESH;
         fd.n_bins = (uint32_t)(gm.nx * gm.ny * gm.nz);
         fd.mesh = (int32_t)m.meshes.size();
@@ -679,10 +691,18 @@ bool flatten_model(FlatModel& m)
 
   if (settings::photon_transport)
     return reject(m, "photon transport is not in the GPU envelope");
-  if (settings::survival_biasing)
-    return reject(m, "survival biasing is not in the GPU v1 envelope");
-  if (settings::weight_windows_on)
-    return reject(m, "weight windows are not in the GPU v1 envelope");
+  // Variance reduction is supported for fixed-source, non-multiplying models
+  // (the shielding case). In eigenvalue mode splitting would have to thread
+  // through fission-bank progeny bookkeeping, so it stays rejected there.
+  const bool vr_requested =
+    settings::survival_biasing || settings::weight_windows_on;
+  if (vr_requested && settings::run_mode != RunMode::FIXED_SOURCE)
+    return reject(m, "variance reduction (survival biasing / weight windows) "
+                     "is only supported for fixed-source runs on the GPU");
+  if (settings::weight_windows_on &&
+      variance_reduction::weight_windows.size() != 1)
+    return reject(m, "the GPU engine supports exactly one weight-window "
+                     "domain");
   if (settings::res_scat_on)
     return reject(
       m, "resonance upscattering (DBRC/RVS) is not in the GPU v1 envelope");
@@ -749,6 +769,42 @@ bool flatten_model(FlatModel& m)
   }
   if (!flatten_tallies(m))
     return false;
+
+  // ---- weight windows ----
+  m.ww_mesh = -1;
+  if (settings::weight_windows_on) {
+    const WeightWindows& ww = *variance_reduction::weight_windows[0];
+    if (ww.particle_type() != ParticleType::neutron())
+      return reject(m, "GPU weight windows support neutrons only");
+    const Mesh* wmesh = ww.mesh().get();
+    GpuMesh gm {};
+    if (!flatten_mesh(m, wmesh, gm))
+      return reject(m, "the weight-window mesh type is outside the GPU "
+                       "envelope (regular and cylindrical are supported)");
+    m.ww_mesh = (int32_t)m.meshes.size();
+    m.ww_n_mesh_bins = (uint32_t)(gm.nx * gm.ny * gm.nz);
+    m.meshes.push_back(gm);
+
+    const auto& eb = ww.energy_bounds();
+    m.ww_n_energy = eb.size() > 1 ? (uint32_t)(eb.size() - 1) : 1u;
+    if (eb.size() > 1)
+      m.ww_ebounds_off = push_f32(m, eb.data(), eb.size());
+    const auto& lo = ww.lower_ww_bounds();
+    const auto& hi = ww.upper_ww_bounds();
+    size_t n_expect = (size_t)m.ww_n_energy * m.ww_n_mesh_bins;
+    if (lo.size() != n_expect || hi.size() != n_expect)
+      return reject(m, "weight-window bounds do not match mesh x energy bins");
+    m.ww_lower_off = (uint32_t)m.f32.size();
+    for (size_t i = 0; i < n_expect; ++i)
+      m.f32.push_back((float)lo.data()[i]);
+    m.ww_upper_off = (uint32_t)m.f32.size();
+    for (size_t i = 0; i < n_expect; ++i)
+      m.f32.push_back((float)hi.data()[i]);
+    m.ww_survival_ratio = ww.survival_ratio();
+    m.ww_max_lb_ratio = ww.max_lower_bound_ratio();
+    m.ww_weight_cutoff = ww.weight_cutoff();
+    m.ww_max_split = ww.max_split();
+  }
   return true;
 }
 

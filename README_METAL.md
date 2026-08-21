@@ -92,9 +92,9 @@ run proceeds normally on the CPU.
 | Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic (`free_gas_threshold` honored), S(a,b) thermal scattering (coherent/incoherent elastic, continuous + discrete inelastic), level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission, energy cutoff | windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models, temperature interpolation, NCrystal, isotropic-in-lab (p0) scattering, time cutoffs |
 | Multigroup: macroscopic isotropic MGXS, tabular/histogram scattering laws, prompt + delayed fission | angle-dependent MGXS, Legendre sampling (use the default `tabular_legendre` conversion) |
 | CSG: all quadric surface types, universes, rectangular lattices, translations/rotations, vacuum/reflective/white BCs | tori, hex lattices, periodic BCs, boundary albedo, DAGMC, distribcell/multi-instance materials |
-| Tallies: cell/material/universe/energy/regular-mesh filters (up to 4 per tally; nested cell/universe matches score every combination, tracklength mesh tallies do track splitting, all as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | translated/rotated or non-regular mesh filters, analog estimators, nuclide bins, differential tallies, other filters/scores |
+| Tallies: cell/material/universe/energy/regular- and cylindrical-mesh filters (up to 4 per tally; nested cell/universe matches score every combination, tracklength mesh tallies do track splitting, all as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | translated/rotated or non-regular mesh filters, analog estimators, nuclide bins, differential tallies, other filters/scores |
 | Standard lost-particle accounting and abort thresholds; upstream statepoint/source outputs | track output, surface-source writing, collision-track files, overlap checking |
-| Analog capture, Russian-roulette-free transport (upstream defaults) | survival biasing, weight windows |
+| Variance reduction in fixed-source runs: survival biasing (implicit capture + Russian roulette) and mesh weight windows (splitting via a global spill bank the host re-dispatches until it drains) | variance reduction in eigenvalue runs, multiple weight-window domains, photon weight windows |
 
 ## Validation (M3 Ultra, ENDF/B-VIII.0, vs CPU OpenMC from this tree)
 
@@ -152,6 +152,38 @@ The remaining GPU levers (history-length divergence on long tungsten
 walks; the shared tally atomics that also cap the CPU) are the
 event-based/wavefront pipeline and threadgroup-local tally tiles, both on
 the roadmap.
+
+## Variance reduction (fixed source)
+
+Deep-penetration shielding is dominated by the rare deep survivors, so
+raw speed matters less than variance reduction. Both mechanisms are
+ported and gated on the analog result:
+
+| Depth in a 0.6 m tungsten slab | survival biasing | weight windows |
+|---|---|---|
+| 30 cm | 1.3× | 0.4× |
+| 45 cm | 4.1× | 4.4× |
+| 55 cm | 1.8× | 7.6× |
+| 60 cm | 0.6× | **19.9×** |
+
+(Figure of merit `1/(relative error² × runtime)` relative to an analog run
+of the same model; weight windows here are a hand-tuned exponential
+`lower ∝ e^{-x/8cm}`, so a generated set should do better.) The gain grows
+with depth, which is the point: weight windows cost time in the shallow
+bins and buy it back where the statistics are thin.
+
+**Unbiasedness** is the property that matters more than the speedup, and
+it is tested rather than assumed: against a 40M-history analog reference,
+two weight-window runs with independent seeds land at mean z = +1.55 and
+−1.34 (deep-half mean ratios 1.0051 and 0.9956) — the deviation flips
+sign with the seed, which is fluctuation, not bias. An analog run at the
+same statistics shows the same spread against the reference. The test
+bounds any bias at roughly the ±0.5% level on the deep bins.
+
+Splitting uses the per-thread secondary stack first and spills to a global
+bank when it is full; the host re-dispatches the spill bank until it
+drains, so results are identical to transporting every secondary in the
+first pass. Dropped secondaries (bank full) are reported, not silent.
 
 ## Architecture## Architecture
 

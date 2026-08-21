@@ -149,6 +149,12 @@ struct GpuSourceSite {
   int32_gpu delayed_group;
   int32_gpu parent_id;  // 0-based current_work of parent particle
   int32_gpu progeny_id; // per-parent fission-site sequence number
+  // variance-reduction state carried across a spill/re-dispatch boundary so
+  // a split particle resumes exactly where its parent left off
+  float wgt_born;    // source weight of the originating history
+  float wgt_ww_born; // weight window the history was born in (-1 = unset)
+  float ww_factor;   // Particle::ww_factor()
+  int32_gpu n_split; // cumulative splits of this history
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +283,22 @@ struct GpuControl {
   // deep-penetration front bin, -0.07% at 1e6).
   uint32_gpu tally_accum_stride; // floats per bank (= tally_accum_size)
   uint32_gpu tally_replicas;    // number of banks (power of two)
+  // ---- variance reduction (fixed-source, non-multiplying models only) ----
+  uint32_gpu ww_on;               // weight windows active
+  int32_gpu ww_mesh;              // index into meshes[] for the WW mesh
+  uint32_gpu ww_n_energy;         // # energy groups (>=1)
+  uint32_gpu ww_ebounds_off;      // f32: ww_n_energy+1 bounds (0 if single)
+  uint32_gpu ww_lower_off;        // f32: [n_energy][n_mesh] lower bounds
+  uint32_gpu ww_upper_off;        // f32: [n_energy][n_mesh] upper bounds
+  uint32_gpu ww_n_mesh_bins;      // mesh bins per energy group
+  float ww_survival_ratio;        // survival_weight = lower * ratio
+  float ww_max_lb_ratio;
+  float ww_weight_cutoff;
+  int32_gpu ww_max_split;
+  int32_gpu ww_max_history_splits;
+  uint32_gpu ww_checkpoint_collision;
+  uint32_gpu ww_checkpoint_surface;
+  uint32_gpu spill_cap;           // capacity of the spill bank
   // i32 arena: per-surface adjacency index (n_surfaces offsets, each to a
   // [count, cell...] list of the cells whose region references the surface)
   uint32_gpu surf_adj_off;
@@ -301,4 +323,8 @@ struct GpuTraceRec {
 // debug event-trace cursor (OPENMC_TRACE_ID); never aliases a loss counter
 #define GPU_CTR_TRACE 8
 #define GPU_CTR_LOST_RECONCILE 9
-#define GPU_CTR_COUNT 10
+// variance reduction: secondaries spilled to the global bank for the host's
+// re-dispatch loop, and secondaries dropped because that bank was full
+#define GPU_CTR_SPILL 10
+#define GPU_CTR_SPILL_DROP 11
+#define GPU_CTR_COUNT 12

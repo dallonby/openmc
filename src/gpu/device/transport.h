@@ -534,6 +534,9 @@ DEVICE_FN GpuMacroXS gpu_mg_score_xs(
 
 struct GpuBanks {
   GLOBAL const GpuSourceSite* source;
+  //! eigenvalue: fission bank. fixed-source: the spill bank that holds
+  //! secondaries (weight-window splits, (n,xn) clones) which did not fit in
+  //! the per-thread stack; the host re-dispatches them until it drains.
   GLOBAL GpuSourceSite* fission;
   GLOBAL gpu_atomic_u32* counters;
   GLOBAL uint32_gpu* progeny;
@@ -593,6 +596,173 @@ DEVICE_FN float gpu_ce_nu_delayed(GpuCeView ce, GpuNuclide nuc, float E)
   return nu;
 }
 
+// ---------------------------------------------------------------------
+// Variance reduction (weight windows + survival biasing). Fixed-source,
+// non-multiplying models only — flatten rejects anything else, so there is
+// no interaction with fission-bank progeny bookkeeping.
+// ---------------------------------------------------------------------
+
+#define GPU_WW_REL_TOL 1.0e-11f
+
+struct GpuVrState {
+  float wgt_born;
+  float wgt_ww_born;
+  float ww_factor;
+  int32_gpu n_split;
+};
+
+//! WeightWindows::get_weight_window — returns false when the particle is
+//! outside the mesh / energy range or the window is invalid (lower <= 0).
+DEVICE_FN bool gpu_ww_lookup(GCONST GpuControl& ctl, GpuTallyView tv, float E,
+  GpuVec3 r, THREAD float* lower, THREAD float* upper)
+{
+  if (!ctl.ww_on)
+    return false;
+  int32_gpu e_bin = 0;
+  if (ctl.ww_n_energy > 1) {
+    GLOBAL const float* eb = tv.f32 + ctl.ww_ebounds_off;
+    if (E < eb[0] || E > eb[ctl.ww_n_energy])
+      return false;
+    uint32_gpu lo = 0, hi = ctl.ww_n_energy;
+    while (hi - lo > 1) {
+      uint32_gpu mid = (lo + hi) / 2;
+      if (E >= eb[mid])
+        lo = mid;
+      else
+        hi = mid;
+    }
+    e_bin = (int32_gpu)lo;
+  }
+  GpuMesh m = tv.meshes[ctl.ww_mesh];
+  int32_gpu ijk[3];
+  if (!gpu_mesh_indices(m, r, tv.f32, ijk))
+    return false;
+  int32_gpu bin = gpu_mesh_bin(m, ijk);
+  if (bin < 0 || bin >= (int32_gpu)ctl.ww_n_mesh_bins)
+    return false;
+  uint32_gpu idx = (uint32_gpu)e_bin * ctl.ww_n_mesh_bins + (uint32_gpu)bin;
+  float lw = tv.f32[ctl.ww_lower_off + idx];
+  if (!(lw > 0.0f)) // invalid / game-off cell
+    return false;
+  *lower = lw;
+  *upper = tv.f32[ctl.ww_upper_off + idx];
+  return true;
+}
+
+//! Push one secondary: per-thread stack first, then the global spill bank.
+DEVICE_FN void gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
+  THREAD GpuSecondary* sec_stack, THREAD int32_gpu* n_stack,
+  THREAD const GpuVrState* vr, GpuVec3 r, GpuVec3 u, float E, float wgt,
+  float time)
+{
+  if (*n_stack < GPU_MAX_SECONDARY_STACK) {
+    THREAD GpuSecondary* sc = &sec_stack[(*n_stack)++];
+    sc->r[0] = r.x;
+    sc->r[1] = r.y;
+    sc->r[2] = r.z;
+    sc->u[0] = u.x;
+    sc->u[1] = u.y;
+    sc->u[2] = u.z;
+    sc->E = E;
+    sc->wgt = wgt;
+    sc->time = time;
+    return;
+  }
+  uint32_gpu idx = gpu_atomic_add_u32(banks.counters + GPU_CTR_SPILL, 1u);
+  if (idx >= ctl.spill_cap) {
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_SPILL_DROP, 1u);
+    return;
+  }
+  GpuSourceSite site;
+  site.r[0] = r.x;
+  site.r[1] = r.y;
+  site.r[2] = r.z;
+  site.u[0] = u.x;
+  site.u[1] = u.y;
+  site.u[2] = u.z;
+  site.E = E;
+  site.time = time;
+  site.wgt = wgt;
+  site.delayed_group = 0;
+  site.parent_id = 0;
+  site.progeny_id = 0;
+  site.wgt_born = vr->wgt_born;
+  site.wgt_ww_born = vr->wgt_ww_born;
+  site.ww_factor = vr->ww_factor;
+  site.n_split = vr->n_split;
+  banks.fission[idx] = site;
+}
+
+//! russian_roulette (physics_common.cpp)
+DEVICE_FN void gpu_russian_roulette(
+  THREAD float* wgt, float weight_survive, THREAD uint64_gpu* seed)
+{
+  if (weight_survive * gpu_prn(seed) < *wgt)
+    *wgt = weight_survive;
+  else
+    *wgt = 0.0f;
+}
+
+//! apply_weight_window (weight_windows.cpp): split above the window,
+//! roulette below it. Splits go to the stack/spill bank.
+DEVICE_FN void gpu_apply_weight_window(GCONST GpuControl& ctl, GpuTallyView tv,
+  GpuBanks banks, THREAD GpuSecondary* sec_stack, THREAD int32_gpu* n_stack,
+  THREAD GpuVrState* vr, GpuVec3 r, GpuVec3 u, float E, float time,
+  THREAD float* wgt, THREAD uint64_gpu* seed)
+{
+  if (*wgt <= 0.0f || E <= 0.0f)
+    return;
+  float lower, upper;
+  if (!gpu_ww_lookup(ctl, tv, E, r, &lower, &upper)) {
+    if (vr->wgt_ww_born == -1.0f)
+      vr->wgt_ww_born = 1.0f;
+    return;
+  }
+  if (vr->wgt_ww_born == -1.0f)
+    vr->wgt_ww_born = 0.5f * (lower + upper);
+  // normalize by the window the history was born in
+  float scale = vr->wgt_born / vr->wgt_ww_born;
+  lower *= scale;
+  upper *= scale;
+  float survival = lower * ctl.ww_survival_ratio;
+  float weight = *wgt;
+
+  if (weight < ctl.ww_weight_cutoff) {
+    *wgt = 0.0f;
+    return;
+  }
+  if (vr->ww_factor == 0.0f && ctl.ww_max_lb_ratio > 1.0f &&
+      weight > lower * ctl.ww_max_lb_ratio)
+    vr->ww_factor = weight / (lower * ctl.ww_max_lb_ratio);
+  if (vr->ww_factor > 1.0f) {
+    lower *= vr->ww_factor;
+    upper *= vr->ww_factor;
+    survival *= vr->ww_factor;
+  }
+
+  if (weight > upper * (1.0f + GPU_WW_REL_TOL)) {
+    if (vr->n_split >= ctl.ww_max_history_splits)
+      return;
+    float n_split = ceilf(weight / ((1.0f + GPU_WW_REL_TOL) * upper));
+    if (n_split < 2.0f)
+      n_split = 2.0f;
+    if (n_split > (float)ctl.ww_max_split)
+      n_split = (float)ctl.ww_max_split;
+    vr->n_split += (int32_gpu)n_split;
+    float w_each = weight / n_split;
+    int32_gpu i_split = (int32_gpu)(n_split + 0.5f);
+    for (int32_gpu l = 0; l < i_split - 1; ++l)
+      gpu_push_secondary(
+        ctl, banks, sec_stack, n_stack, vr, r, u, E, w_each, time);
+    *wgt = w_each;
+  } else if (weight < lower * (1.0f - GPU_WW_REL_TOL)) {
+    float ws = weight * (float)ctl.ww_max_split;
+    if (survival < ws)
+      ws = survival;
+    gpu_russian_roulette(wgt, ws, seed);
+  }
+}
+
 //! Full history for one source particle. Mirrors the CPU event loop.
 DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuSabView sab,
@@ -631,6 +801,13 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
     g = (int32_gpu)src.E;
     E = geom.f32[ctl.mg_bin_avg_off + g];
   }
+
+  // variance-reduction state (inherited across a spill boundary)
+  GpuVrState vr;
+  vr.wgt_born = (src.wgt_born > 0.0f) ? src.wgt_born : wgt;
+  vr.wgt_ww_born = src.wgt_ww_born;
+  vr.ww_factor = src.ww_factor;
+  vr.n_split = src.n_split;
 
   float k_tl = 0.0f, k_col = 0.0f, k_abs = 0.0f, k_leak = 0.0f;
   int32_gpu n_progeny = 0;
@@ -916,6 +1093,13 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               }
             }
           } else {
+            // weight-window surface checkpoint (particle.cpp:400)
+            if (ctl.ww_on && ctl.ww_checkpoint_surface && wgt > 0.0f) {
+              gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
+                gs.coord[0].r, gs.coord[0].u, E, time, &wgt, &seeds[stream]);
+              if (wgt <= 0.0f)
+                break;
+            }
             // transmission: search from the crossing level down, trying
             // the crossed surface's adjacent cells first
             if (!gpu_local_find_cell_adj(geom, &gs, ctl.n_coord_levels)) {
@@ -1110,9 +1294,16 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 (float)(seeds[GPU_STREAM_URR_PTABLE] & 0xffffffu);
             }
           }
-          // ---- absorption (analog, physics.cpp:672) ----
+          // ---- absorption (physics.cpp:672) ----
           if (mic->absorption > 0.0f) {
-            if (mic->absorption > gpu_prn(&seeds[stream]) * mic->total) {
+            if (ctl.survival_biasing) {
+              // implicit capture: remove the absorbed fraction of the weight
+              float wgt_absorb = wgt * mic->absorption / mic->total;
+              wgt -= wgt_absorb;
+              if (ctl.run_mode == GPU_RUN_EIGENVALUE)
+                k_abs += wgt_absorb * mic->nu_fission / mic->absorption;
+            } else if (mic->absorption >
+                       gpu_prn(&seeds[stream]) * mic->total) {
               k_abs += wgt * mic->nu_fission / mic->absorption;
               wgt = 0.0f;
 #ifdef GPU_HOST_DEBUG
@@ -1248,7 +1439,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 if (floorf(y) == y && y > 0.0f && E >= ctl.energy_cutoff) {
                   int32_gpu extra = (int32_gpu)(y + 0.5f) - 1;
                   for (int32_gpu q = 0; q < extra; ++q) {
-                    if (n_stack < GPU_MAX_SECONDARY_STACK) {
+                    if (ctl.run_mode == GPU_RUN_FIXED_SOURCE) {
+                      gpu_push_secondary(ctl, banks, sec_stack, &n_stack, &vr,
+                        gs.coord[0].r, gs.coord[0].u, E, wgt, time);
+                    } else if (n_stack < GPU_MAX_SECONDARY_STACK) {
                       THREAD GpuSecondary* sc = &sec_stack[n_stack++];
                       sc->r[0] = gs.coord[0].r.x;
                       sc->r[1] = gs.coord[0].r.y;
@@ -1323,7 +1517,12 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           }
           bool absorbed = false;
           if (xs.absorption > 0.0f) {
-            if (xs.absorption > gpu_prn(&seeds[stream]) * xs.total) {
+            if (ctl.survival_biasing) {
+              float wgt_absorb = wgt * xs.absorption / xs.total;
+              wgt -= wgt_absorb;
+              if (ctl.run_mode == GPU_RUN_EIGENVALUE)
+                k_abs += wgt_absorb * xs.nu_fission / xs.absorption;
+            } else if (xs.absorption > gpu_prn(&seeds[stream]) * xs.total) {
               k_abs += wgt * xs.nu_fission / xs.absorption;
               wgt = 0.0f;
               absorbed = true;
@@ -1349,6 +1548,18 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             } else {
               gs.coord[j].u = parent->u;
             }
+          }
+        }
+
+        // ---- post-collision variance reduction (collision(),
+        // physics.cpp:99-116): weight windows at the collision checkpoint,
+        // else russian roulette when survival biasing is on ----
+        if (wgt > 0.0f) {
+          if (ctl.ww_on && ctl.ww_checkpoint_collision) {
+            gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
+              gs.coord[0].r, gs.coord[0].u, E, time, &wgt, &seeds[stream]);
+          } else if (ctl.survival_biasing && wgt < ctl.weight_cutoff) {
+            gpu_russian_roulette(&wgt, ctl.weight_survive, &seeds[stream]);
           }
         }
 

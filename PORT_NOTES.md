@@ -44,10 +44,32 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    (`flush_thread_accumulators`). Godiva with tallies went from 1.74M/s
    at 16 threads / 0.81M/s at 28 to 4.69M/s / 3.92M/s, results
    bit-identical (k and every tally bin unchanged to the last digit).
-   This is a strong upstream candidate for many-core hosts. A smaller
-   residual (16 -> 28 threads still droops slightly) is the remaining
-   per-score tally atomics; threadgroup/thread-local tally tiles are the
-   next step.
+   **This is Apple-specific — NOT an upstream candidate.** A clean A/B on
+   an AMD EPYC 9654 (96 cores / 192 threads, single socket, 12 CCDs;
+   pristine upstream `develop` vs `develop` + only this patch, both
+   CPU-only) shows the *unpatched* build scaling monotonically to 192
+   threads with **no cliff** (MG eigenvalue, keff-only atomics: 0.048 M/s
+   at 1 thread -> 1.33 M/s at 192, a soft plateau above ~96), and the
+   *patched* build 4-20% **slower** at every thread count (the per-particle
+   `thread_num()` indirection and per-generation flush cost more than the
+   atomic saves on a fabric where the atomic is cheap). The M3 Ultra's
+   two-die packaging is what makes the contended cross-die atomic
+   catastrophic; a monolithic-I/O-die x86 does not have the pathology. So
+   the fix stays on this (Apple) branch, where it is a 4.8x win at 28
+   threads, and is deliberately **not** proposed upstream. Raw EPYC sweep:
+
+   | threads | develop (M/s) | +patch (M/s) |
+   |---|---|---|
+   | 1 | 0.048 | 0.048 |
+   | 32 | 0.74 | 0.59 |
+   | 64 | 1.02 | 0.91 |
+   | 128 | 1.32 | 1.14 |
+   | 192 | 1.33 | 1.09 |
+
+   (k bit-identical base vs patched at every thread count.) The MG
+   with-tally residual — a mild plateau on EPYC (peak 0.38 M/s at 48
+   threads), a hard collapse on Apple — is the separate per-bin
+   tally-scoring atomics, unaddressed by this fix.
 
 4. **The event-based queue sort is dead code** (`src/event.cpp:81` —
    commented out pending TBB); `EventQueueItem::operator<` exists and works.

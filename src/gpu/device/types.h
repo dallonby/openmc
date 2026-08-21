@@ -186,6 +186,11 @@ struct GpuMesh { // regular structured mesh
   float wx, wy, wz; // element width
 };
 
+// Filters per tally are bounded so the device can enumerate every
+// combination of per-level filter matches (cell/universe filters can match
+// at several coordinate levels; CPU FilterBinIter scores the product).
+#define GPU_MAX_TALLY_FILTERS 4
+
 struct GpuTallyDesc {
   uint32_gpu accum_off; // f32 accumulator arena offset
   uint32_gpu n_filter_bins;
@@ -245,6 +250,9 @@ struct GpuControl {
   uint32_gpu urr_on;
   uint32_gpu debug_iso_mu; // ablation: force isotropic CM elastic
   int32_gpu trace_id;      // 1-based particle to trace, or -1
+  float energy_cutoff;     // CE: kill neutrons below this after a collision
+  float free_gas_threshold;     // settings::free_gas_threshold (in kT units)
+  uint32_gpu mg_default_iv_off; // f32 arena: default inverse velocity [G]
 };
 
 // device trace record (debug)
@@ -263,4 +271,6 @@ struct GpuTraceRec {
 #define GPU_CTR_LOST_ADVANCE 5
 #define GPU_CTR_LOST_LATTICE 6
 #define GPU_CTR_LOST_REFLECT 7
-#define GPU_CTR_COUNT 8
+// debug event-trace cursor (OPENMC_TRACE_ID); never aliases a loss counter
+#define GPU_CTR_TRACE 8
+#define GPU_CTR_COUNT 9

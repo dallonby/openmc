@@ -46,6 +46,7 @@ struct FlatModel {
   uint32_t tally_accum_size {0};
 
   uint32_t mg_bin_avg_off {0};
+  uint32_t mg_default_iv_off {0};
 
   //! empty when the model flattened cleanly; otherwise names the first
   //! unsupported feature (the engine then stays inactive)

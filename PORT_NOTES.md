@@ -45,6 +45,29 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    Noted for the future event-based GPU mode, where the same sort is the
    standard divergence-reduction step.
 
+5. **MG non-analog tally scores apply `density_mult` inconsistently**
+   (observation, mirrored on this branch for parity): `Mgxs::calculate_xs`
+   multiplies the cached macro total/absorption/nu-fission by
+   `p.density_mult()`, and `SCORE_TOTAL` / `SCORE_ABSORPTION` score from
+   that cache — but non-analog `SCORE_FISSION` / `SCORE_NU_FISSION` /
+   `SCORE_SCATTER` go through `Mgxs::get_xs`, which never applies
+   `density_mult` (`tally_scoring.cpp`). For any cell with a density
+   multiplier ≠ 1 in MG mode, total/absorption and fission/scatter tallies
+   use different densities. The GPU scores reproduce the CPU behavior
+   exactly (`gpu_mg_score_xs`).
+
+6. **`ContinuousTabular::sample` applies the lin-lin inversion to discrete
+   lines** (`distribution_energy.cpp`): after a discrete hit (`r1 < c[k]`,
+   `k < n_discrete`), the histogram branch correctly returns the line
+   energy, but a lin-lin table falls into the continuous inversion with a
+   *negative* `r1 - c_k`, shifting the sampled energy off the discrete
+   line. The GPU sampler deliberately deviates here and returns the exact
+   line energy for any discrete hit. Reachable only for ACE tables mixing
+   discrete lines with lin-lin interpolation. Related quirk, mirrored
+   rather than fixed: `CorrelatedAngleEnergy::sample_dist` leaves `c_k1`
+   stale (== `c_k`) when the CDF walk exhausts the last bin, so the
+   nearest-CDF angle-table pick always chooses table `k+1` there.
+
 ## fp32 design decisions (and their evidence)
 
 ### Geometry tolerances
@@ -109,17 +132,18 @@ top-24-bit `(bits + 0.5) * 2^-24` in (0,1) instead of 53-bit fp64 —
 midpoint offset keeps `log(xi)` finite without measurable bias (1.8e-8 on
 the mean flight length).
 
-## Validation status (2026-08-20)
+## Validation status (2026-08-21, after the cross-review fix wave)
 
 | Case | CPU | GPU | Agreement |
 |---|---|---|---|
-| 7-group MG 3x3 pin lattice, 10M active | k=1.34156(24) | k=1.34193(25) | 1.1 sigma |
-| CE PWR pincell (no S(a,b)), 3M active | k=1.23939(57) | k=1.23971(53) | 0.4 sigma; 58 tally bins mean z^2 = 0.88-1.01 |
-| CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23672(47) | 0.3 sigma; 58 tally bins mean z^2 = 0.23-1.25 |
-| CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=0.99499(71) | **-630 pcm — open item, see below** |
+| 7-group MG 3x3 pin lattice, 10M active | k=1.34156(24) | k=1.34171(24) | 0.4 sigma; 70 tally bins |
+| CE PWR pincell (no S(a,b)), 3M active | k=1.23939(57) | k=1.23923(52) | 0.2 sigma; 58 tally bins |
+| CE PWR pincell with S(a,b), 3M active | k=1.23691(54) | k=1.23734(52) | 0.6 sigma; 58 tally bins (an independent seed gave +1.9 sigma — jointly unremarkable) |
+| CE Godiva (57% leakage), 1M active | k=1.00125(59) | k=1.00138(71) | 0.1 sigma |
+| CE Godiva, 11M active | k=1.00041(22) | k=1.00017(21) | 0.8 sigma (dk = -24 pcm); leakage fraction 0.57294(15) vs 0.57314(16) |
 
-Lost particles: ~1e-4 of histories (pincell), 0 (Godiva), ~7e-6 (MG
-lattice); counted and warned per generation.
+Lost particles: ~5e-5 of histories (pincell, init-class), 0 (Godiva),
+~7e-6 (MG lattice); counted and warned per generation.
 
 Cross-ISA check of the CPU reference itself: an x86_64 build of this tree
 run under Rosetta 2 reproduces the native arm64 build **bit-for-bit** on
@@ -130,34 +154,113 @@ trajectory reshuffling from ulp-level libm differences under translation
 0.18-0.66). The fp64 CPU reference used for GPU validation is therefore
 instruction-set-independent.
 
+## Resolved: the Godiva device-vs-host bias was a Metal recursion miscompile
+
+The -630 pcm Godiva discrepancy (and the device-vs-replay paired-history
+divergence behind it) is **fixed and root-caused**. `gpu_sample_dist`
+dispatched MULTI (applicability) and UNCORR (angle-wrapper) AngleEnergy
+laws by *recursing into itself*. MSL formally forbids recursion; the
+Metal compiler accepted the code and silently miscompiled it, corrupting
+a fraction of sampled secondaries (level-inelastic mu prominently — the
+forensic trace of "bitwise identical through five events, then a
+different mu from an identical RNG cursor" was this). The host-compiled
+replay engine compiled the same recursion correctly, which is why replay
+matched fp64 CPU while the device did not, and why the effect survived
+safe math mode, FP contraction settings, and the bit-portable math layer
+— it was never a floating-point effect.
+
+Fix: MULTI/UNCORR now resolve through a bounded iterative redirect loop
+(`gpu_sample_dist` -> `gpu_sample_dist_terminal`), preserving the CPU RN
+order exactly.
+
+Evidence (Godiva, one 2M-particle generation, identical source and
+seeds, device vs host-compiled replay of the same engine source):
+
+| Build | paired leak-bit disagreements | device leak | replay leak |
+|---|---|---|---|
+| iterative dispatch (fixed) | **0 / 2,000,000 (0.0000%)** | 0.418545 | 0.418545 |
+| recursive dispatch (ablation) | 53,182 (2.6591%) | 0.417245 | 0.418545 |
+
+The ablation reproduces the historical 2.66% flip rate and the 0.13%
+absolute leak deficit exactly; restoring the iterative dispatcher returns
+the engine to bit-identical leak outcomes. k on Godiva moved from
+0.99499(71) to 1.00138(71) at 1M histories (CPU: 1.00125(59)) and agrees
+to -24 pcm at 11M histories.
+
+Practical rule for this codebase (and the future CUDA backend): **no
+recursion in device code, ever, even when the toolchain appears to accept
+it.** The `sab.h` MIXED_EL redirect loop already followed this rule; the
+distribution dispatcher now does too.
+
 ## Open items
 
-1. **Device-arithmetic ensemble bias on leakage-dominated fast systems**
-   (the Godiva -0.5%). Forensic state: per-event physics verified unbiased
-   (sampler A/B audits vs the CPU objects at 6 energies; XS chain to 2e-8
-   mean; full elastic kinematics swept 1e4-1.5e7 eV paired-seed); host-
-   compiled engine (replay) matches fp64 CPU to 3e-5 leak on frozen
-   sources; the Metal-compiled binary of the same source diverges from
-   replay on 2.66% of paired histories with an 11.7 sigma non-leak
-   asymmetry — *stable under safe math mode, FP contraction off, and the
-   portable math layer* (bit-identical math verified on device). A traced
-   divergent history is bitwise identical through five events including
-   RNG cursor fingerprints, then samples a different level-inelastic mu
-   from an apparently identical cursor. Next steps: trace the angle-table
-   index and r1 bits inside the sampler on-device; suspect remaining
-   candidates are a Metal compiler transform in the branchy tabular-scan
-   loops or an unnoticed address-space aliasing effect. Moderated systems
-   are unaffected (pincell 0.4 sigma).
-2. Fixed-source mode, MPI, photon transport, DAGMC, hex lattices, tori,
+1. Fixed-source mode, MPI, photon transport, DAGMC, hex lattices, tori,
    periodic BCs, survival biasing, weight windows, multi-temperature
-   models, distribcell — all detected and fall back to CPU with a warning.
-3. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
+   models, temperature interpolation, resonance upscattering (DBRC/RVS),
+   NCrystal, isotropic-in-lab (p0) scattering, neutron time cutoffs,
+   mesh tally filters, distribcell — all detected and fall back to CPU
+   with a warning.
+2. Event-based device pipeline (history-based v1 leaves SIMD occupancy on
    the table for CE); unionized/material-major energy grids.
-4. CUDA backend: the dialect and backend ABI are in place
+3. CUDA backend: the dialect and backend ABI are in place
    (`src/gpu/device/dialect.h`, `src/gpu/backend.h`); needs
    `backend_cuda.cu` implementing the same slots and a kernel wrapper, plus
    `-ffp-contract=off`/`--fmad=false` for bit parity with the portable
    math layer.
+
+## 2026-08-21 cross-review fix wave
+
+The branch was independently reviewed (external AI review tooling reading
+this tree against the CPU sources); every claim was re-verified against
+both code paths before acting. Fixes landed, all CPU-faithfulness or
+correctness items:
+
+* **Watt spectrum** (`gpu_watt_spectrum`): fluctuating term used
+  `sqrt(a*b*W)` instead of `sqrt(a^2 b W)` — the spectrum width collapsed
+  ~1000x for eV-scale `a`. Live wherever ACE laws use Watt.
+* **Recursive AngleEnergy dispatch** replaced with an iterative redirect
+  loop — root cause of the Godiva bias (see above).
+* **Lattice exit** (`gpu_cross_lattice`): leaving a lattice now re-searches
+  from the base coords like CPU `cross_lattice`, instead of losing the
+  particle (no `outer`) or searching `outer` in tile-local coordinates.
+* **`reconcile_cell_after_collision` ported**: a direction change during a
+  near-surface collision re-validates every coordinate level; previously
+  the stale cell chain could track a history through the wrong material
+  across a curved surface.
+* **Cell/universe tally filters** now score every matching coordinate
+  level (cartesian product over filters, as CPU `FilterBinIter`), not the
+  first hit. Filters per tally bounded at `GPU_MAX_TALLY_FILTERS` (4),
+  rejected above.
+* **Partial fission**: the reaction is picked once per collision before
+  the site-count RN (CPU `sample_fission` order), not per site; delayed
+  precursor yields/decay/spectra come from the *selected* reaction.
+* **Complex-region distance**: coincident-surface skipping now applies
+  only when actually on a surface (`on_surface != 0`), matching
+  `Region::distance_complex`; union cells no longer skip genuinely-near
+  first boundaries.
+* **MG SCORE_SCATTER** scores scatter (nu-scatter / mean multiplicity),
+  not the nu-scatter integral; MG fission/nu-fission scores drop
+  `density_mult` to mirror the CPU `get_xs` asymmetry (upstream finding 5).
+* **MG fission-site RN order** (mu, phi, then energy), **histogram-flat
+  angle collapse removed** (kept for tabular, where the RN count matches),
+  **MG void/zero inverse-velocity time advance** via
+  `default_inverse_velocity`.
+* **`rotate_angle` pole branch** now uses the CPU expansion (was a
+  constant azimuth phase offset — statistically identical but it split
+  paired trajectories); **white-BC grazing** uses `>=` like
+  `Surface::diffuse_reflect`; **BCs on nested-universe surfaces** mark the
+  particle lost (CPU behavior) instead of reflecting in the root frame.
+* **Energy cutoff** implemented (kill after collision, CE);
+  **`free_gas_threshold`** passed through instead of hardcoded 400 kT;
+  unsupported-feature rejections added for DBRC/RVS, NCrystal, p0
+  lab-isotropic scattering, temperature interpolation, finite neutron
+  time cutoffs.
+* **`gpu_sample_tabular`** keeps the CPU walk's exact stale-`c_k` /
+  `c_k1` lifecycle (discrete+continuous ACE tables, correlated-law angle
+  pick); duplicate fp32-cast energy-grid knots guarded (`r -> 0`).
+* **Trace counter** got its own slot (`GPU_CTR_TRACE`) instead of
+  aliasing `GPU_CTR_LOST_REFLECT`; fission-bank overflow now warns like
+  CPU; the CPU-side `OPENMC_ISO_MU` ablation hook caches its `getenv`.
 
 ## Debug tooling (env-gated, zero cost when unset)
 

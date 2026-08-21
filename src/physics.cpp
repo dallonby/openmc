@@ -865,7 +865,9 @@ void elastic_scatter(int i_nuclide, const Reaction& rx, double kT, Particle& p)
   auto& d = rx.products_[0].distribution_[0];
   auto d_ = dynamic_cast<UncorrelatedAngleEnergy*>(d.get());
   // ablation hook for GPU-parity debugging: force isotropic CM elastic
-  if (std::getenv("OPENMC_ISO_MU")) {
+  // (getenv resolved once — this is the elastic-scatter hot path)
+  static const bool iso_mu_ablation = std::getenv("OPENMC_ISO_MU") != nullptr;
+  if (iso_mu_ablation) {
     mu_cm = uniform_distribution(-1., 1., p.current_seed());
   } else if (!d_->angle().empty()) {
     mu_cm = d_->angle().sample(p.E(), p.current_seed());

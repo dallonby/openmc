@@ -484,14 +484,16 @@ DEVICE_FN GpuCellDist gpu_cell_distance(
       g, tok, c.n_tokens, r, u, on_surface, false);
 
   // complex region: advance past virtual crossings until region membership
-  // actually changes
+  // actually changes. Coincident hits are skipped only while actually on a
+  // surface (CPU: ignore_coincident_surfaces = on_surface != 0) — dropping
+  // them unconditionally would skip a genuinely-near first boundary.
   bool in_region = gpu_contains_complex(g, tok, c.n_tokens, r, u, on_surface);
   float d_total = 0.0f;
   GpuVec3 rr = r;
   int32_gpu on = on_surface;
   for (int iter = 0; iter < GPU_MAX_VIRTUAL_CROSSINGS; ++iter) {
     GpuCellDist cand =
-      gpu_cell_distance_nearest(g, tok, c.n_tokens, rr, u, on, true);
+      gpu_cell_distance_nearest(g, tok, c.n_tokens, rr, u, on, on != 0);
     if (cand.d == GPU_INFTY)
       return none;
     d_total += cand.d;
@@ -859,20 +861,23 @@ DEVICE_FN bool gpu_cross_lattice(
   c->r = gpu_lat_local(lat, rr, c->li);
   c->u = uu;
 
+  bool ok;
   if (!gpu_lat_valid(lat, c->li)) {
-    if (lat.outer == GPU_C_NONE)
-      return false;
-    c->universe = lat.outer;
+    // The particle left the lattice. CPU (geometry.cpp cross_lattice)
+    // always re-searches from the base coords; the root descent then lands
+    // in `outer` (or the parent cell) via the normal lattice-fill logic.
+    // Searching `outer` at the tile level here would use tile-local
+    // coordinates and can mis-place the particle.
+    ok = gpu_exhaustive_find_cell(g, p, root, levels);
   } else {
     c->universe = g.i32[lat.univ_off + gpu_lat_flat(lat, c->li)];
+    c->cell = GPU_C_NONE;
+    if (gpu_find_cell_inner(g, p, levels))
+      ok = true;
+    else
+      // corner crossing rescue: full re-search from root
+      ok = gpu_exhaustive_find_cell(g, p, root, levels);
   }
-  c->cell = GPU_C_NONE;
-  bool ok;
-  if (gpu_find_cell_inner(g, p, levels))
-    ok = true;
-  else
-    // corner crossing rescue: full re-search from root
-    ok = gpu_exhaustive_find_cell(g, p, root, levels);
 #ifdef GPU_HOST_DEBUG
   if (ok && !gpu_cell_contains(
               g, p->coord[0].cell, p->coord[0].r, p->coord[0].u, p->surface))

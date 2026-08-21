@@ -153,14 +153,11 @@ public:
   //! \param group_id An HDF5 group id.
   void to_hdf5(hid_t group_id) const;
 
-protected:
-  bool is_3d_; //!< Has divisions along the z-axis?
-
-public:
   //! Read-only accessor (used by device flatteners)
   bool is_3d() const { return is_3d_; }
 
 protected:
+  bool is_3d_; //!< Has divisions along the z-axis?
 
   virtual void to_hdf5_inner(hid_t group_id) const = 0;
 };

@@ -451,6 +451,9 @@ void transport_generation()
   ctl->n_cells = (uint32_t)eng.flat.cells.size();
   ctl->n_surfaces = (uint32_t)eng.flat.surfaces.size();
   ctl->mg_bin_avg_off = eng.flat.mg_bin_avg_off;
+  ctl->mg_default_iv_off = eng.flat.mg_default_iv_off;
+  ctl->energy_cutoff = (float)settings::energy_cutoff[0];
+  ctl->free_gas_threshold = (float)settings::free_gas_threshold;
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -982,7 +985,7 @@ void transport_generation()
   if (ctl->trace_id >= 0) {
     auto* tr =
       static_cast<GpuTraceRec*>(omg_metal_contents(eng.ctx, OMG_SLOT_TRACE));
-    uint32_t nrec = std::min(ctr[7], (uint32_t)GPU_TRACE_MAX);
+    uint32_t nrec = std::min(ctr[GPU_CTR_TRACE], (uint32_t)GPU_TRACE_MAX);
     for (uint32_t i = 0; i < nrec; ++i) {
       const char* names[5] = {
         "fly", "collide", "elastic", "inelastic", "postfis"};
@@ -992,6 +995,13 @@ void transport_generation()
     }
   }
   uint32_t n_sites = std::min(ctr[GPU_CTR_FISSION_BANK], ctl->fission_bank_cap);
+  if (ctr[GPU_CTR_FISSION_BANK] > ctl->fission_bank_cap) {
+    warning(fmt::format(
+      "The GPU fission bank is full ({} sites sampled, capacity {}). "
+      "Additional fission sites were not banked; results may be "
+      "non-deterministic.",
+      ctr[GPU_CTR_FISSION_BANK], ctl->fission_bank_cap));
+  }
   uint32_t n_lost = ctr[GPU_CTR_LOST];
   if (n_lost > 0) {
     eng.lost_total += n_lost;

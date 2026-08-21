@@ -5,10 +5,11 @@
 //! (distribution_angle/energy, secondary_{uncorrelated,kalbach,correlated,
 //! nbody}) and the collision flow (physics.cpp) @ develop 86ceaad3c.
 //!
-//! v1 envelope: single temperature per nuclide (chosen at flatten), no
-//! S(a,b) (flattener rejects), no DBRC/RVS resonance upscattering (off by
-//! default upstream), no photon production, analog capture. Random-number
-//! consumption order mirrors the CPU exactly where trajectories are shared.
+//! v1 envelope: single temperature per nuclide (chosen at flatten), S(a,b)
+//! thermal scattering via sab.h, no DBRC/RVS resonance upscattering
+//! (flattener rejects when enabled), no photon production, analog capture.
+//! Random-number consumption order mirrors the CPU exactly where
+//! trajectories are shared.
 
 #pragma once
 
@@ -310,11 +311,17 @@ DEVICE_FN float gpu_ce_elastic_xs(
 //! of ContinuousTabular::sample / Tabular::sample.
 DEVICE_FN float gpu_sample_tabular(GLOBAL const float* x, GLOBAL const float* p,
   GLOBAL const float* c, int32_gpu n, int32_gpu n_discrete, int32_gpu interp,
-  float r1, THREAD int32_gpu* k_out, THREAD float* c_k_out)
+  float r1, THREAD int32_gpu* k_out, THREAD float* c_k_out,
+  THREAD float* c_k1_out)
 {
-  // discrete lines first
+  // discrete lines first. c_k / c_k1 keep the CPU walk's exact lifecycle:
+  // c_k stays stale (c[k-1]) on the first continuous bin after discrete
+  // lines, and c_k1 is only assigned inside the continuous loop (INFTY when
+  // that loop never runs; stale == c_k when it exhausts the last bin) —
+  // the correlated law's nearest-CDF angle pick depends on both quirks.
   int32_gpu k = 0;
   float c_k = c[0];
+  float c_k1 = GPU_INFTY;
   int32_gpu end = n - 2;
   bool discrete_hit = false;
   for (int32_gpu j = 0; j < n_discrete; ++j) {
@@ -329,18 +336,16 @@ DEVICE_FN float gpu_sample_tabular(GLOBAL const float* x, GLOBAL const float* p,
   if (!discrete_hit) {
     for (int32_gpu j = n_discrete; j < end; ++j) {
       k = j;
-      float c_k1 = c[k + 1];
+      c_k1 = c[k + 1];
       if (r1 < c_k1)
         break;
       k = j + 1;
       c_k = c_k1;
     }
-    if (k < n_discrete)
-      k = n_discrete;
-    c_k = c[k];
   }
   *k_out = k;
   *c_k_out = c_k;
+  *c_k1_out = c_k1;
 
   float xk = x[k];
 #ifdef GPU_HOST_DEBUG
@@ -394,8 +399,12 @@ DEVICE_FN float gpu_sample_angle_dist(
       }
     }
     i = lo;
-    if (i + 1 < n_e)
-      r = (E - eg[i]) / (eg[i + 1] - eg[i]);
+    if (i + 1 < n_e) {
+      // fp32 casts can collapse adjacent fp64 knots; r -> 0 matches the
+      // CPU limit (E == both knots) instead of an Inf/NaN pick
+      float de = eg[i + 1] - eg[i];
+      r = (de > 0.0f) ? (E - eg[i]) / de : 0.0f;
+    }
   }
   if (r > gpu_prn(seed))
     ++i;
@@ -407,8 +416,8 @@ DEVICE_FN float gpu_sample_angle_dist(
   GLOBAL const float* c = mu + 2 * n_mu;
   float r1 = gpu_prn(seed);
   int32_gpu k;
-  float ck;
-  float m = gpu_sample_tabular(mu, p, c, n_mu, 0, interp, r1, &k, &ck);
+  float ck, ck1;
+  float m = gpu_sample_tabular(mu, p, c, n_mu, 0, interp, r1, &k, &ck, &ck1);
 #ifdef GPU_HOST_DEBUG
   gpu_host_debug_angle(i, r1, k, ck, n_mu, interp, mu[k], p[k], m);
 #endif
@@ -436,12 +445,13 @@ DEVICE_FN float gpu_watt_spectrum(float a, float b, THREAD uint64_gpu* seed)
 {
   float w = gpu_maxwell_spectrum(a, seed);
   float u = 2.0f * gpu_prn(seed) - 1.0f;
-  return w + 0.25f * a * a * b + u * sqrtf(a * b * w);
+  return w + 0.25f * a * a * b + u * sqrtf(a * a * b * w);
 }
 
-//! Sample one AngleEnergy distribution (descriptor at `blob`).
+//! Sample one terminal AngleEnergy law. MULTI and UNCORR redirects are
+//! resolved iteratively in gpu_sample_dist (MSL forbids recursion).
 //! Mirrors the per-law algorithms including RN order.
-DEVICE_FN GpuSampleEA gpu_sample_dist(
+DEVICE_FN GpuSampleEA gpu_sample_dist_terminal(
   GpuCeView ce, int32_gpu blob, float E_in, THREAD uint64_gpu* seed)
 {
   GpuSampleEA out;
@@ -451,23 +461,6 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
   int32_gpu type = h[0];
 
   switch (type) {
-  case GPU_DIST_MULTI: {
-    // [1] n, then n pairs (applicability_f1d, dist_off)
-    int32_gpu n = h[1];
-    int32_gpu pick = n - 1;
-    if (n > 1) {
-      float prob = 0.0f;
-      float c = gpu_prn(seed);
-      for (int32_gpu i = 0; i < n; ++i) {
-        prob += gpu_f1d(ce, h[2 + 2 * i], E_in);
-        if (c <= prob) {
-          pick = i;
-          break;
-        }
-      }
-    }
-    return gpu_sample_dist(ce, h[2 + 2 * pick + 1], E_in, seed);
-  }
   case GPU_DIST_LEVEL: {
     GLOBAL const float* d = ce.f32 + h[1]; // threshold, mass_ratio
     out.E_out = d[1] * (E_in - d[0]);
@@ -532,19 +525,6 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     out.E_out = E_max * x / (x + y);
     return out;
   }
-  case GPU_DIST_UNCORR: {
-    // [1] angle blob or -1, [2] energy dist blob
-    // CPU order: angle first, then energy
-    float mu;
-    if (h[1] >= 0)
-      mu = gpu_sample_angle_dist(ce, h[1], E_in, seed);
-    else
-      mu = 2.0f * gpu_prn(seed) - 1.0f;
-    GpuSampleEA e = gpu_sample_dist(ce, h[2], E_in, seed);
-    out.mu = mu;
-    out.E_out = e.E_out;
-    return out;
-  }
   case GPU_DIST_CONT_TAB:
   case GPU_DIST_KALBACH: {
     // header: [1] histogram_interp (cont-tab only), [2] n_E,
@@ -574,8 +554,10 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
           }
         }
         i = lo;
-        if (i + 1 < n_e)
-          r = (E_in - eg[i]) / (eg[i + 1] - eg[i]);
+        if (i + 1 < n_e) {
+          float de = eg[i + 1] - eg[i];
+          r = (de > 0.0f) ? (E_in - eg[i]) / de : 0.0f;
+        }
       }
     } else {
       if (E_in < eg[0]) {
@@ -594,7 +576,8 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
             hi = mid;
         }
         i = lo;
-        r = (E_in - eg[i]) / (eg[i + 1] - eg[i]);
+        float de = eg[i + 1] - eg[i];
+        r = (de > 0.0f) ? (E_in - eg[i]) / de : 0.0f;
       }
     }
     int32_gpu l = i;
@@ -629,9 +612,9 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
 
     float r1 = gpu_prn(seed);
     int32_gpu k;
-    float c_k;
-    float E_out =
-      gpu_sample_tabular(xe, pe, cc, n_out, n_disc, interp, r1, &k, &c_k);
+    float c_k, c_k1;
+    float E_out = gpu_sample_tabular(
+      xe, pe, cc, n_out, n_disc, interp, r1, &k, &c_k, &c_k1);
 
     float km_r = 0.0f, km_a = 0.0f;
     if (km) {
@@ -699,8 +682,10 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
         }
       }
       i = lo;
-      if (i + 1 < n_e)
-        r = (E_in - eg[i]) / (eg[i + 1] - eg[i]);
+      if (i + 1 < n_e) {
+        float de = eg[i + 1] - eg[i];
+        r = (de > 0.0f) ? (E_in - eg[i]) / de : 0.0f;
+      }
     }
     int32_gpu l = i;
     if (r > gpu_prn(seed))
@@ -725,9 +710,9 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
 
     float r1 = gpu_prn(seed);
     int32_gpu k;
-    float c_k;
-    float E_out =
-      gpu_sample_tabular(xe, pe, cc, n_out, n_disc, interp, r1, &k, &c_k);
+    float c_k, c_k1;
+    float E_out = gpu_sample_tabular(
+      xe, pe, cc, n_out, n_disc, interp, r1, &k, &c_k, &c_k1);
     if (k >= n_disc && n_out > 1) {
       float El_1 = xe[n_disc];
       float El_K = xe[n_out - 1];
@@ -736,8 +721,9 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     }
     out.E_out = E_out;
 
-    // nearest-CDF-neighbour angle table (histogram: always k)
-    float c_k1 = (k + 1 < n_out) ? cc[k + 1] : GPU_INFTY;
+    // nearest-CDF-neighbour angle table (histogram: always k). c_k1 is the
+    // CPU walk's value: INFTY on a discrete hit, stale (== c_k) when the
+    // walk exhausts the last bin — which then always picks table k+1.
     int32_gpu kk = k;
     if (!(r1 - c_k < c_k1 - r1 || interp == GPU_INTERP_HISTOGRAM))
       kk = k + 1;
@@ -749,9 +735,9 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     GLOBAL const float* mc = mv + 2 * n_mu;
     float r2 = gpu_prn(seed);
     int32_gpu km_;
-    float ck_;
-    float mu =
-      gpu_sample_tabular(mv, mp, mc, n_mu, 0, mu_interp, r2, &km_, &ck_);
+    float ck_, ck1_;
+    float mu = gpu_sample_tabular(
+      mv, mp, mc, n_mu, 0, mu_interp, r2, &km_, &ck_, &ck1_);
     if (mu > 1.0f)
       mu = 1.0f;
     if (mu < -1.0f)
@@ -760,6 +746,55 @@ DEVICE_FN GpuSampleEA gpu_sample_dist(
     return out;
   }
   }
+  return out;
+}
+
+//! Sample one AngleEnergy distribution (descriptor at `blob`). MULTI
+//! (applicability pick) and UNCORR (angle wrapper) redirect into a nested
+//! law; MSL forbids recursion, so they are resolved iteratively with the
+//! CPU's RN order (MULTI's pick RN, then UNCORR's angle, then the nested
+//! law's draws). An UNCORR angle overrides the terminal law's mu, exactly
+//! as the CPU wrapper does. Real trees are at most MULTI -> UNCORR ->
+//! energy law; the bound is a safety net.
+DEVICE_FN GpuSampleEA gpu_sample_dist(
+  GpuCeView ce, int32_gpu blob, float E_in, THREAD uint64_gpu* seed)
+{
+  float mu_uncorr = 1.0f;
+  bool has_uncorr_mu = false;
+  for (int redirect = 0; redirect < 8; ++redirect) {
+    GLOBAL const int32_gpu* h = ce.i32 + blob;
+    int32_gpu type = h[0];
+    if (type == GPU_DIST_MULTI) {
+      // [1] n, then n pairs (applicability_f1d, dist_off)
+      int32_gpu n = h[1];
+      int32_gpu pick = n - 1;
+      if (n > 1) {
+        float prob = 0.0f;
+        float c = gpu_prn(seed);
+        for (int32_gpu i = 0; i < n; ++i) {
+          prob += gpu_f1d(ce, h[2 + 2 * i], E_in);
+          if (c <= prob) {
+            pick = i;
+            break;
+          }
+        }
+      }
+      blob = h[2 + 2 * pick + 1];
+    } else if (type == GPU_DIST_UNCORR) {
+      // [1] angle blob or -1, [2] energy dist blob; CPU order: angle first
+      if (h[1] >= 0)
+        mu_uncorr = gpu_sample_angle_dist(ce, h[1], E_in, seed);
+      else
+        mu_uncorr = 2.0f * gpu_prn(seed) - 1.0f;
+      has_uncorr_mu = true;
+      blob = h[2];
+    } else {
+      break;
+    }
+  }
+  GpuSampleEA out = gpu_sample_dist_terminal(ce, blob, E_in, seed);
+  if (has_uncorr_mu)
+    out.mu = mu_uncorr;
   return out;
 }
 

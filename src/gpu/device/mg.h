@@ -79,7 +79,12 @@ DEVICE_FN GpuMacroXS gpu_mg_calculate_xs(
 }
 
 // rotate_angle (math_functions.cpp:772): rotate direction u by polar cosine
-// mu with azimuth sampled uniformly. Mirrors the CPU pole guard structure.
+// mu with azimuth sampled uniformly. The pole branch uses the CPU's exact
+// expansion about the v component (a different-but-valid frame there would
+// be a constant azimuth phase — statistically identical but it splits
+// paired CPU/GPU trajectories for z-aligned directions). The pole test
+// matches CPU's 1e-10: in fp32 the smallest nonzero b is ~3.4e-4, so any
+// smaller threshold selects exactly the b == 0 case.
 DEVICE_FN GpuVec3 gpu_rotate_angle(GpuVec3 u, float mu, THREAD uint64_gpu* seed)
 {
   float phi = 6.283185307179586f * gpu_prn(seed);
@@ -89,17 +94,17 @@ DEVICE_FN GpuVec3 gpu_rotate_angle(GpuVec3 u, float mu, THREAD uint64_gpu* seed)
   float u0 = u.x, v0 = u.y, w0 = u.z;
   float b = sqrtf(fmaxf(0.0f, 1.0f - w0 * w0));
   GpuVec3 out;
-  if (b > 1.0e-5f) {
+  if (b > 1.0e-10f) {
     out.x = mu * u0 + a * (u0 * w0 * cos_phi - v0 * sin_phi) / b;
     out.y = mu * v0 + a * (v0 * w0 * cos_phi + u0 * sin_phi) / b;
     out.z = mu * w0 - a * b * cos_phi;
   } else {
     b = sqrtf(fmaxf(0.0f, 1.0f - v0 * v0));
-    out.x = mu * u0 + a * (u0 * v0 * cos_phi + w0 * sin_phi) / b;
-    out.y = mu * v0 - a * b * cos_phi;
-    out.z = mu * w0 + a * (v0 * w0 * cos_phi - u0 * sin_phi) / b;
+    out.x = mu * u0 + a * (-u0 * v0 * sin_phi + w0 * cos_phi) / b;
+    out.y = mu * v0 + a * b * sin_phi;
+    out.z = mu * w0 - a * (v0 * w0 * sin_phi + u0 * cos_phi) / b;
   }
-  // renormalize to guard fp32 drift
+  // renormalize to guard fp32 drift (CPU fp64 skips this)
   float n = sqrtf(out.x * out.x + out.y * out.y + out.z * out.z);
   out.x /= n;
   out.y /= n;

@@ -1,8 +1,8 @@
 //! \file gpu_interface.h
 //! Host-side interface to the GPU transport engine (Apple Metal backend
 //! today; the device code and backend ABI are structured so an NVIDIA/CUDA
-//! backend can be added without touching the kernels — see
-//! docs/source/methods/gpu.rst).
+//! backend can be added without touching the kernels — see README_METAL.md
+//! and PORT_NOTES.md at the repository root).
 
 #ifndef OPENMC_GPU_INTERFACE_H
 #define OPENMC_GPU_INTERFACE_H

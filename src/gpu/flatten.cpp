@@ -279,6 +279,11 @@ bool flatten_mg(FlatModel& m)
   m.mg_bin_avg_off =
     push_f32(m, mgi.energy_bin_avg_.data(), mgi.energy_bin_avg_.size());
 
+  // default inverse velocity: Particle::speed() uses it in void and as the
+  // get_xs fallback for non-positive material entries
+  m.mg_default_iv_off = push_f32(m, mgi.default_inverse_velocity_.data(),
+    mgi.default_inverse_velocity_.size());
+
   m.mgmats.clear();
   m.materials.clear();
   for (size_t im = 0; im < model::materials.size(); ++im) {
@@ -321,12 +326,20 @@ bool flatten_mg(FlatModel& m)
     push_vec(xd.nu_fission);
     push_vec(xd.prompt_nu_fission);
     push_vec(xd.fission);
-    // scatt_xs from ScattData
+    // SCORE_SCATTER vector: CPU MgxsType::SCATTER divides the nu-scatter
+    // P0 integral (ScattData::scattxs) by the energy-weighted mean
+    // multiplicity (scattdata.cpp get_xs); transport itself never uses
+    // this vector, so it carries the score semantics directly
     const ScattData* sd = xd.scatter.empty() ? nullptr : xd.scatter[0].get();
     if (!sd)
       return reject(m, fmt::format("MG data '{}' missing scatter", mx.name));
-    for (int g = 0; g < G; ++g)
-      m.f32.push_back((float)sd->scattxs(g));
+    for (int g = 0; g < G; ++g) {
+      double mult_avg = 0.0;
+      for (size_t j = 0; j < sd->energy[g].size(); ++j)
+        mult_avg += sd->mult[g][j] * sd->energy[g][j];
+      double sxs = sd->scattxs(g);
+      m.f32.push_back((float)(mult_avg > 0.0 ? sxs / mult_avg : sxs));
+    }
     push_vec(xd.inverse_velocity);
 
     // chi_prompt [a][gin][gout]
@@ -394,13 +407,18 @@ bool flatten_mg(FlatModel& m)
         const auto& f = fmu[g][j];
         const auto& cdf = sd->dist[g][j];
         int n_mu = (int)f.size();
-        // flat distribution → isotropic shortcut (saves table walks)
-        bool flat = true;
-        for (double v : f)
-          if (std::abs(v - 0.5) > 1e-12) {
-            flat = false;
-            break;
-          }
+        // flat TABULAR distribution → isotropic shortcut (same 1-RN cost
+        // as the CPU tabular inverse-CDF). Histogram sampling draws 2 RNs
+        // on the CPU (bin + intra-bin), so collapsing it would shift the
+        // particle's RN stream — histogram tables always keep their law.
+        bool flat = tab != nullptr;
+        if (flat) {
+          for (double v : f)
+            if (std::abs(v - 0.5) > 1e-12) {
+              flat = false;
+              break;
+            }
+        }
         int32_t type =
           flat ? GPU_MG_ANGLE_ISOTROPIC
                : (tab ? GPU_MG_ANGLE_TABULAR : GPU_MG_ANGLE_HISTOGRAM);
@@ -468,6 +486,10 @@ bool flatten_tallies(FlatModel& m)
     td.estimator = est;
     td.filter_off = (uint32_t)m.filters.size();
     td.n_filters = (uint32_t)t->filters().size();
+    if (td.n_filters > GPU_MAX_TALLY_FILTERS)
+      return reject(
+        m, fmt::format("tally {} has more than {} filters (GPU v1 limit)",
+             t->id(), GPU_MAX_TALLY_FILTERS));
 
     for (int fi = 0; fi < (int)t->filters().size(); ++fi) {
       const Filter* f = model::tally_filters[t->filters(fi)].get();
@@ -564,6 +586,27 @@ bool flatten_model(FlatModel& m)
     return reject(m, "survival biasing is not in the GPU v1 envelope");
   if (settings::weight_windows_on)
     return reject(m, "weight windows are not in the GPU v1 envelope");
+  if (settings::res_scat_on)
+    return reject(
+      m, "resonance upscattering (DBRC/RVS) is not in the GPU v1 envelope");
+  if (settings::temperature_method == TemperatureMethod::INTERPOLATION)
+    return reject(m, "temperature interpolation is not in the GPU v1 "
+                     "envelope (use nearest)");
+  if (settings::time_cutoff[0] < INFTY)
+    return reject(
+      m, "a neutron time cutoff is not in the GPU v1 envelope");
+  for (const auto& mat : model::materials) {
+    if (mat->ncrystal_mat())
+      return reject(m,
+        fmt::format(
+          "material {} uses NCrystal (not in the GPU envelope)", mat->id_));
+    for (bool p0 : mat->p0_)
+      if (p0)
+        return reject(
+          m, fmt::format("material {} uses isotropic-in-lab (p0) scattering "
+                         "(not in the GPU envelope)",
+               mat->id_));
+  }
   if (settings::solver_type != SolverType::MONTE_CARLO)
     return reject(m, "random ray solver cannot run on the GPU engine");
   if (settings::ufs_on)

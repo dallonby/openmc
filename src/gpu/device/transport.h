@@ -45,37 +45,46 @@ struct GpuTallyView {
   uint32_gpu n_tallies;
 };
 
-//! Match one filter; returns bin index or -1.
-DEVICE_FN int32_gpu gpu_filter_match(
-  GpuTallyView tv, GpuFilterDesc f, THREAD const GpuGeomState* gs, float E)
+//! Match one filter. Writes every matching bin (cell/universe filters can
+//! match at several coordinate levels — CPU get_all_bins pushes them all
+//! and FilterBinIter scores the cartesian product) and returns the count;
+//! 0 means the filter missed. `bins` must hold GPU_MAX_COORD entries.
+DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
+  THREAD const GpuGeomState* gs, float E, THREAD int32_gpu* bins)
 {
   switch (f.type) {
   case GPU_FILTER_CELL: {
+    int32_gpu cnt = 0;
     for (int32_gpu j = 0; j < gs->n_coord; ++j) {
       int32_gpu b = tv.i32[f.map_off + gs->coord[j].cell];
       if (b >= 0)
-        return b;
+        bins[cnt++] = b;
     }
-    return -1;
+    return cnt;
   }
   case GPU_FILTER_MATERIAL: {
     if (gs->material < 0)
-      return -1;
-    return tv.i32[f.map_off + gs->material];
+      return 0;
+    int32_gpu b = tv.i32[f.map_off + gs->material];
+    if (b < 0)
+      return 0;
+    bins[0] = b;
+    return 1;
   }
   case GPU_FILTER_UNIVERSE: {
+    int32_gpu cnt = 0;
     for (int32_gpu j = 0; j < gs->n_coord; ++j) {
       int32_gpu b = tv.i32[f.map_off + gs->coord[j].universe];
       if (b >= 0)
-        return b;
+        bins[cnt++] = b;
     }
-    return -1;
+    return cnt;
   }
   case GPU_FILTER_ENERGY: {
     GLOBAL const float* edges = tv.f32 + f.map_off;
     uint32_gpu n = f.n_bins;
     if (E < edges[0] || E > edges[n])
-      return -1;
+      return 0;
     uint32_gpu lo = 0, hi = n;
     while (hi - lo > 1) {
       uint32_gpu mid = (lo + hi) / 2;
@@ -84,25 +93,32 @@ DEVICE_FN int32_gpu gpu_filter_match(
       else
         hi = mid;
     }
-    return (int32_gpu)lo;
+    bins[0] = (int32_gpu)lo;
+    return 1;
   }
   case GPU_FILTER_MESH: {
+    // Point sample at the current position: exact for the collision
+    // estimator only. Tracklength mesh tallies need CPU-style track
+    // splitting, so flatten rejects mesh filters (dead path, kept for the
+    // future event-based port).
     GpuMesh mesh = tv.meshes[f.mesh];
     GpuVec3 r = gs->coord[0].r;
     int32_gpu i = (int32_gpu)floorf((r.x - mesh.llx) / mesh.wx);
     int32_gpu j = (int32_gpu)floorf((r.y - mesh.lly) / mesh.wy);
     int32_gpu k = (int32_gpu)floorf((r.z - mesh.llz) / mesh.wz);
     if (i < 0 || i >= mesh.nx || j < 0 || j >= mesh.ny || k < 0 || k >= mesh.nz)
-      return -1;
-    return mesh.nx * mesh.ny * k + mesh.nx * j + i;
+      return 0;
+    bins[0] = mesh.nx * mesh.ny * k + mesh.nx * j + i;
+    return 1;
   }
   }
-  return -1;
+  return 0;
 }
 
 //! Score all tallies of the given estimator for one event.
 //! coeff: tracklength -> wgt * distance; collision -> wgt / Sigma_t.
 //! Macroscopic score values are supplied by the caller (mode-specific).
+//! Every combination of per-filter matches is scored (CPU FilterBinIter).
 DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
   uint32_gpu estimator, float coeff, float E, GpuMacroXS xs, float scat,
   float elastic)
@@ -111,54 +127,87 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
     GpuTallyDesc td = tv.tallies[t];
     if (td.estimator != estimator)
       continue;
-    int32_gpu flat = 0;
+    int32_gpu fbins[GPU_MAX_TALLY_FILTERS][GPU_MAX_COORD];
+    int32_gpu fcnt[GPU_MAX_TALLY_FILTERS];
     bool miss = false;
     for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
       GpuFilterDesc f = tv.filters[td.filter_off + fi];
-      int32_gpu b = gpu_filter_match(tv, f, gs, E);
-      if (b < 0) {
+      fcnt[fi] = gpu_filter_match(tv, f, gs, E, fbins[fi]);
+      if (fcnt[fi] == 0) {
         miss = true;
         break;
       }
-      flat += b * (int32_gpu)f.stride;
     }
     if (miss)
       continue;
-    for (uint32_gpu s = 0; s < td.n_scores; ++s) {
-      int32_gpu code = tv.i32[td.score_off + s];
-      float val;
-      switch (code) {
-      case GPU_SCORE_FLUX:
-        val = coeff;
-        break;
-      case GPU_SCORE_TOTAL:
-        val = coeff * xs.total;
-        break;
-      case GPU_SCORE_ABSORPTION:
-        val = coeff * xs.absorption;
-        break;
-      case GPU_SCORE_FISSION:
-        val = coeff * xs.fission;
-        break;
-      case GPU_SCORE_NU_FISSION:
-        val = coeff * xs.nu_fission;
-        break;
-      case GPU_SCORE_SCATTER:
-        val = coeff * scat;
-        break;
-      case GPU_SCORE_ELASTIC:
-        val = coeff * elastic;
-        break;
-      default:
-        val = 0.0f;
-        break;
+    int32_gpu idx[GPU_MAX_TALLY_FILTERS] = {0, 0, 0, 0};
+    for (;;) {
+      int32_gpu flat = 0;
+      for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
+        GpuFilterDesc f = tv.filters[td.filter_off + fi];
+        flat += fbins[fi][idx[fi]] * (int32_gpu)f.stride;
       }
-      if (val != 0.0f) {
-        gpu_atomic_add_f(
-          tv.accum + td.accum_off + (uint32_gpu)flat * td.n_scores + s, val);
+      for (uint32_gpu s = 0; s < td.n_scores; ++s) {
+        int32_gpu code = tv.i32[td.score_off + s];
+        float val;
+        switch (code) {
+        case GPU_SCORE_FLUX:
+          val = coeff;
+          break;
+        case GPU_SCORE_TOTAL:
+          val = coeff * xs.total;
+          break;
+        case GPU_SCORE_ABSORPTION:
+          val = coeff * xs.absorption;
+          break;
+        case GPU_SCORE_FISSION:
+          val = coeff * xs.fission;
+          break;
+        case GPU_SCORE_NU_FISSION:
+          val = coeff * xs.nu_fission;
+          break;
+        case GPU_SCORE_SCATTER:
+          val = coeff * scat;
+          break;
+        case GPU_SCORE_ELASTIC:
+          val = coeff * elastic;
+          break;
+        default:
+          val = 0.0f;
+          break;
+        }
+        if (val != 0.0f) {
+          gpu_atomic_add_f(
+            tv.accum + td.accum_off + (uint32_gpu)flat * td.n_scores + s, val);
+        }
       }
+      // odometer over the per-filter match lists
+      int32_gpu fi = (int32_gpu)td.n_filters - 1;
+      for (; fi >= 0; --fi) {
+        if (++idx[fi] < fcnt[fi])
+          break;
+        idx[fi] = 0;
+      }
+      if (fi < 0)
+        break;
     }
   }
+}
+
+//! MG tally-score cross sections. CPU scores SCORE_TOTAL / SCORE_ABSORPTION
+//! from the density_mult-scaled macro cache but SCORE_FISSION /
+//! SCORE_NU_FISSION / SCORE_SCATTER through Mgxs::get_xs, which does NOT
+//! apply density_mult — an upstream asymmetry, mirrored here for parity
+//! (see PORT_NOTES.md).
+DEVICE_FN GpuMacroXS gpu_mg_score_xs(
+  GpuMgView mg, int32_gpu i_mat, int32_gpu g, GpuMacroXS xs)
+{
+  GpuMgMat m = mg.mats[i_mat];
+  GpuMacroXS s = xs;
+  s.fission = gpu_mg_vec(mg, m, GPU_MGV_FISSION, g);
+  s.nu_fission =
+    m.fissionable ? gpu_mg_vec(mg, m, GPU_MGV_NU_FISSION, g) : 0.0f;
+  return s;
 }
 
 // -------------------------------------------------------------- transport --
@@ -359,7 +408,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         (float)(seeds[stream] & 0xffffffu), gs.boundary.d, E);
 #endif
       if ((int32_gpu)index_source == ctl.trace_id) {
-        uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
+        uint32_gpu ti = gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
         if (ti < GPU_TRACE_MAX) {
           banks.trace[ti].code = 0.0f;
           banks.trace[ti].a = distance;
@@ -370,9 +419,17 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       gpu_move_distance(&gs, distance);
       if (is_ce) {
         time += distance / gpu_neutron_speed(E);
-      } else if (gs.material != GPU_MATERIAL_VOID) {
-        GpuMgMat m = mg.mats[gs.material];
-        time += distance * gpu_mg_vec(mg, m, GPU_MGV_INV_VELOCITY, g);
+      } else {
+        // Particle::speed(): the default inverse velocity covers void and
+        // any material entry that is not positive (mgxs.cpp get_xs)
+        float iv = geom.f32[ctl.mg_default_iv_off + g];
+        if (gs.material != GPU_MATERIAL_VOID) {
+          GpuMgMat m = mg.mats[gs.material];
+          float miv = gpu_mg_vec(mg, m, GPU_MGV_INV_VELOCITY, g);
+          if (miv > 0.0f)
+            iv = miv;
+        }
+        time += distance * iv;
       }
       // tracklength keff estimator
       k_tl += wgt * distance * xs.nu_fission;
@@ -389,11 +446,16 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             }
           } else {
             GpuMgMat m = mg.mats[gs.material];
-            mac_scat = gpu_mg_vec(mg, m, GPU_MGV_SCATT_XS, g) * gs.density_mult;
+            // CPU MgxsType::SCATTER via get_xs: no density_mult (the
+            // flattened vector is already multiplicity-corrected)
+            mac_scat = gpu_mg_vec(mg, m, GPU_MGV_SCATT_XS, g);
           }
         }
+        GpuMacroXS xs_sc = (is_ce || gs.material == GPU_MATERIAL_VOID)
+                             ? xs
+                             : gpu_mg_score_xs(mg, gs.material, g, xs);
         gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_TRACKLENGTH, wgt * distance, E,
-          xs, mac_scat, mac_elastic);
+          xs_sc, mac_scat, mac_elastic);
       }
       if (distance > GPU_TINY_BIT)
         gs.surface = GPU_SURFACE_NONE;
@@ -426,6 +488,14 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 #endif
             break;
           } else if (surf.bc == GPU_BC_REFLECTIVE || surf.bc == GPU_BC_WHITE) {
+            // CPU cross_reflective_bc: BCs on lower-universe surfaces are
+            // fatal (the surface frame there is not the root frame)
+            if (gs.n_coord != 1) {
+              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST_REFLECT, 1u);
+              wgt = 0.0f;
+              break;
+            }
             GpuVec3 r0 = gs.coord[0].r;
             GpuVec3 u0 = gs.coord[0].u;
             GpuVec3 n = gpu_surf_normal(geom, i_surf, r0);
@@ -433,11 +503,13 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             if (surf.bc == GPU_BC_REFLECTIVE) {
               u_new = gpu_reflect_dir(u0, n);
             } else {
+              // Surface::diffuse_reflect: mu about the unflipped normalized
+              // normal, with '>=' so grazing (u.n == 0) reflects inward
               float nn = gpu_norm(n);
               GpuVec3 n_hat = gpu_scale(n, 1.0f / nn);
-              if (gpu_dot(u0, n_hat) > 0.0f)
-                n_hat = gpu_scale(n_hat, -1.0f);
-              float mu_r = sqrtf(gpu_prn(&seeds[stream]));
+              float proj = gpu_dot(u0, n_hat);
+              float mu_r = (proj >= 0.0f) ? -sqrtf(gpu_prn(&seeds[stream]))
+                                          : sqrtf(gpu_prn(&seeds[stream]));
               u_new = gpu_rotate_angle(n_hat, mu_r, &seeds[stream]);
             }
             float un = gpu_norm(u_new);
@@ -484,6 +556,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       } else {
         // ---- event_collide ----
         k_col += wgt * xs.nu_fission / xs.total;
+        // preserved for post-collision cell reconciliation (particle.cpp)
+        bool near_surface = (gs.surface != GPU_SURFACE_NONE);
         gs.surface = GPU_SURFACE_NONE;
         float E_pre = E;
 #ifdef GPU_HOST_DEBUG
@@ -492,8 +566,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 
         // collision-estimator tallies (pre-collision weight)
         if (tv.n_tallies > 0) {
+          GpuMacroXS xs_sc =
+            is_ce ? xs : gpu_mg_score_xs(mg, gs.material, g, xs);
           gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_COLLISION, wgt / xs.total, E,
-            xs, mac_scat, mac_elastic);
+            xs_sc, mac_scat, mac_elastic);
         }
 
         if (is_ce) {
@@ -515,7 +591,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           gpu_host_trace_collide(index_source, E, gs.coord[0].r, i_nuc);
 #endif
           if ((int32_gpu)index_source == ctl.trace_id) {
-            uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
+            uint32_gpu ti = gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
             if (ti < GPU_TRACE_MAX) {
               banks.trace[ti].code = 1.0f;
               banks.trace[ti].a = E;
@@ -527,6 +603,31 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           // ---- fission bank (physics.cpp:174) ----
           if (nuc.fissionable && mic->fission > 0.0f &&
               ctl.run_mode == GPU_RUN_EIGENVALUE) {
+            // sample_fission (physics.cpp:629): ONE partial-fission pick
+            // per collision, before the site count — every site from this
+            // collision uses the same reaction, and the RN is consumed
+            // even when the sampled site count is 0 (CPU RN order).
+            int32_gpu rec0 = ce.i32[nuc.fis_rx_off];
+            int32_gpu rec = rec0;
+            if (nuc.n_fission_rx > 1 && !mic->use_ptable) {
+              float fcut = gpu_prn(&seeds[stream]) * mic->fission;
+              float fpr = 0.0f;
+              for (uint32_gpu fr = 0; fr < nuc.n_fission_rx; ++fr) {
+                rec = ce.i32[nuc.fis_rx_off + fr];
+                GLOBAL const int32_gpu* rh = ce.i32 + ce.i32[rec];
+                int32_gpu thr = rh[GPU_RX_THRESHOLD];
+                if (mic->i_grid >= thr &&
+                    mic->i_grid - thr + 1 < rh[GPU_RX_NXS]) {
+                  GLOBAL const float* rxs = ce.f32 + rh[GPU_RX_XSOFF];
+                  int32_gpu kk = mic->i_grid - thr;
+                  fpr += (1.0f - mic->interp) * rxs[kk] +
+                         mic->interp * rxs[kk + 1];
+                }
+                if (fpr > fcut)
+                  break;
+              }
+            }
+            int32_gpu rec_n_prod = ce.i32[rec + 1];
             float nu_t = wgt / ctl.keff * mic->nu_fission / mic->total;
             int32_gpu nu = (int32_gpu)nu_t;
             if (gpu_prn(&seeds[stream]) <= (nu_t - (float)nu))
@@ -539,28 +640,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               site.time = time;
               site.wgt = 1.0f;
               site.delayed_group = 0;
-              // sample_fission (physics.cpp:586): partial-fission
-              // selection consumes one RN unless in the URR
-              int32_gpu rec = ce.i32[nuc.fis_rx_off];
-              if (nuc.n_fission_rx > 1 && !mic->use_ptable) {
-                float fcut = gpu_prn(&seeds[stream]) * mic->fission;
-                float fpr = 0.0f;
-                for (uint32_gpu fr = 0; fr < nuc.n_fission_rx; ++fr) {
-                  rec = ce.i32[nuc.fis_rx_off + fr];
-                  GLOBAL const int32_gpu* rh = ce.i32 + ce.i32[rec];
-                  int32_gpu thr = rh[GPU_RX_THRESHOLD];
-                  if (mic->i_grid >= thr &&
-                      mic->i_grid - thr + 1 < rh[GPU_RX_NXS]) {
-                    GLOBAL const float* rxs = ce.f32 + rh[GPU_RX_XSOFF];
-                    int32_gpu kk = mic->i_grid - thr;
-                    fpr += (1.0f - mic->interp) * rxs[kk] +
-                           mic->interp * rxs[kk + 1];
-                  }
-                  if (fpr > fcut)
-                    break;
-                }
-              }
-              int32_gpu n_prod = ce.i32[rec + 1];
+              int32_gpu prec = rec; // reaction supplying the products
+              int32_gpu n_prod = rec_n_prod;
               // sample_fission_neutron (physics.cpp:1077)
               float nu_tot = gpu_f1d(ce, nuc.total_nu_f1d, E);
               float nu_d =
@@ -568,34 +649,35 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               float beta = (nu_tot > 0.0f) ? nu_d / nu_tot : 0.0f;
               int32_gpu dg = 0; // product index (0 = prompt)
               if (nuc.n_delayed > 0 && gpu_prn(&seeds[stream]) < beta) {
+                // CPU walks the SELECTED reaction's delayed-product yields
+                // (rx.products_[group]); fall back to the first fission
+                // reaction only when the partial carries no delayed
+                // products (upstream would index out of bounds there).
+                if (n_prod <= 1) {
+                  prec = rec0;
+                  n_prod = ce.i32[prec + 1];
+                }
                 float xi = gpu_prn(&seeds[stream]) * nu_d;
-                int32_gpu rec0 = ce.i32[nuc.fis_rx_off];
                 float pr = 0.0f;
                 uint32_gpu gg = 1;
                 for (; gg < nuc.n_delayed; ++gg) {
-                  pr += gpu_f1d(ce, ce.i32[rec0 + 2 + 3 * gg], E);
+                  pr += gpu_f1d(ce, ce.i32[prec + 2 + 3 * gg], E);
                   if (xi < pr)
                     break;
                 }
                 if (gg > nuc.n_delayed)
                   gg = nuc.n_delayed;
                 dg = (int32_gpu)gg;
-                // delayed products come from the selected reaction when it
-                // has them, else from the first fission reaction
-                if (dg >= n_prod) {
-                  rec = rec0;
-                  n_prod = ce.i32[rec + 1];
-                  if (dg >= n_prod)
-                    dg = n_prod - 1;
-                }
+                if (dg >= n_prod)
+                  dg = n_prod - 1;
                 site.delayed_group = dg;
-                float lambda = ce.f32[ce.i32[rec + 2 + 3 * dg + 2]];
+                float lambda = ce.f32[ce.i32[prec + 2 + 3 * dg + 2]];
                 site.time -= logf(gpu_prn(&seeds[stream])) / lambda;
               }
               // energy from the product distribution (reject above E_max)
               float mu_f = 1.0f;
               float E_f = 0.0f;
-              int32_gpu dist = ce.i32[rec + 2 + 3 * dg + 1];
+              int32_gpu dist = ce.i32[prec + 2 + 3 * dg + 1];
               for (int it = 0; it < 100; ++it) {
                 GpuSampleEA sf = gpu_sample_dist(ce, dist, E, &seeds[stream]);
                 E_f = sf.E_out;
@@ -629,7 +711,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             (uint32_gpu)(seeds[GPU_STREAM_URR_PTABLE] & 0xffffffu));
 #endif
           if ((int32_gpu)index_source == ctl.trace_id) {
-            uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
+            uint32_gpu ti = gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
             if (ti < GPU_TRACE_MAX) {
               banks.trace[ti].code = 4.0f;
               banks.trace[ti].a = (float)(seeds[stream] & 0xffffffu);
@@ -679,7 +761,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               GpuVec3 v_n = gpu_scale(u0, vel);
               GpuVec3 v_t = gpu_v3(0.0f, 0.0f, 0.0f);
               if (!mic->use_ptable &&
-                  (E < 400.0f * nuc.kT || nuc.awr <= 1.0f)) {
+                  (E < ctl.free_gas_threshold * nuc.kT || nuc.awr <= 1.0f)) {
                 v_t = gpu_sample_cxs_target_velocity(
                   nuc.awr, E, u0, nuc.kT, &seeds[stream]);
               }
@@ -706,7 +788,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               gpu_host_trace_elastic(index_source, E);
 #endif
               if ((int32_gpu)index_source == ctl.trace_id) {
-                uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
+                uint32_gpu ti = gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
                 if (ti < GPU_TRACE_MAX) {
                   banks.trace[ti].code = 2.0f;
                   banks.trace[ti].a = E;
@@ -737,7 +819,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               gpu_host_trace_inelastic(index_source, rx[GPU_RX_MT]);
 #endif
               if ((int32_gpu)index_source == ctl.trace_id) {
-                uint32_gpu ti = gpu_atomic_add_u32(banks.counters + 7, 1u);
+                uint32_gpu ti = gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
                 if (ti < GPU_TRACE_MAX) {
                   banks.trace[ti].code = 3.0f;
                   banks.trace[ti].a = (float)rx[GPU_RX_MT];
@@ -804,6 +886,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             gpu_advance_prn_seed(
               (int64_gpu)ce.n_nuclides, &seeds[GPU_STREAM_URR_PTABLE]);
           }
+          // energy cutoff (physics.cpp:112): kill, not clamp
+          if (wgt > 0.0f && E < ctl.energy_cutoff)
+            wgt = 0.0f;
         } else {
           // ---- multigroup collision (physics_mg.cpp) ----
           GpuMgMat m = mg.mats[gs.material];
@@ -813,10 +898,11 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             if (gpu_prn(&seeds[stream]) <= (nu_t - (float)nu))
               ++nu;
             for (int32_gpu n = 0; n < nu; ++n) {
-              GpuMgFission fe =
-                gpu_mg_sample_fission_energy(mg, m, g, &seeds[stream]);
+              // CPU RN order (physics_mg.cpp:144): mu, phi, then energy
               float mu_f = 2.0f * gpu_prn(&seeds[stream]) - 1.0f;
               float phi = 6.283185307179586f * gpu_prn(&seeds[stream]);
+              GpuMgFission fe =
+                gpu_mg_sample_fission_energy(mg, m, g, &seeds[stream]);
               GpuSourceSite site;
               site.r[0] = gs.coord[0].r.x;
               site.r[1] = gs.coord[0].r.y;
@@ -870,6 +956,35 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               gs.coord[j].u = gpu_rotate(parent->u, geom.f32 + pc.rot_off);
             } else {
               gs.coord[j].u = parent->u;
+            }
+          }
+        }
+
+        // reconcile_cell_after_collision (geometry.cpp): a direction change
+        // during a near-surface collision can leave the cell chain
+        // inconsistent with the new direction (the on-surface token decided
+        // membership before; it is cleared now)
+        if (near_surface && wgt > 0.0f) {
+          int32_gpu invalid_level = -1;
+          for (int32_gpu lev = 0; lev < gs.n_coord; ++lev) {
+            if (gs.coord[lev].cell == GPU_C_NONE ||
+                !gpu_cell_contains(geom, gs.coord[lev].cell, gs.coord[lev].r,
+                  gs.coord[lev].u, GPU_SURFACE_NONE)) {
+              invalid_level = lev;
+              break;
+            }
+          }
+          if (invalid_level >= 0) {
+            bool fixed = false;
+            if (gs.coord[invalid_level].cell != GPU_C_NONE) {
+              gs.n_coord = invalid_level + 1;
+              fixed = gpu_local_find_cell(geom, &gs, ctl.n_coord_levels);
+            }
+            if (!fixed &&
+                !gpu_exhaustive_find_cell(
+                  geom, &gs, ctl.root_universe, ctl.n_coord_levels)) {
+              gpu_atomic_add_u32(banks.counters + GPU_CTR_LOST, 1u);
+              wgt = 0.0f;
             }
           }
         }

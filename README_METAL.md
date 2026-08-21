@@ -92,7 +92,7 @@ run proceeds normally on the CPU.
 | Continuous-energy neutrons: pointwise XS, URR probability tables, free-gas elastic (`free_gas_threshold` honored), S(a,b) thermal scattering (coherent/incoherent elastic, continuous + discrete inelastic), level/continuum inelastic (uncorrelated, Kalbach-Mann, correlated, N-body), (n,xn), prompt + delayed fission, energy cutoff | windowed multipole, resonance upscattering (DBRC/RVS), multi-temperature models, temperature interpolation, NCrystal, isotropic-in-lab (p0) scattering, time cutoffs |
 | Multigroup: macroscopic isotropic MGXS, tabular/histogram scattering laws, prompt + delayed fission | angle-dependent MGXS, Legendre sampling (use the default `tabular_legendre` conversion) |
 | CSG: all quadric surface types, universes, rectangular lattices, translations/rotations, vacuum/reflective/white BCs | tori, hex lattices, periodic BCs, boundary albedo, DAGMC, distribcell/multi-instance materials |
-| Tallies: cell/material/universe/energy filters (up to 4 per tally, nested cell/universe matches score every combination as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | mesh filters (tracklength track-splitting not ported), analog estimators, nuclide bins, differential tallies, other filters/scores |
+| Tallies: cell/material/universe/energy/regular-mesh filters (up to 4 per tally; nested cell/universe matches score every combination, tracklength mesh tallies do track splitting, all as on CPU); flux, total, absorption, fission, nu-fission, scatter, elastic scores; tracklength + collision estimators | translated/rotated or non-regular mesh filters, analog estimators, nuclide bins, differential tallies, other filters/scores |
 | Standard lost-particle accounting and abort thresholds; upstream statepoint/source outputs | track output, surface-source writing, collision-track files, overlap checking |
 | Analog capture, Russian-roulette-free transport (upstream defaults) | survival biasing, weight windows |
 
@@ -125,10 +125,12 @@ the Metal engine now reproduces the host-compiled engine's leak outcome
 Active-batch calculation rates with tallies enabled on an M3 Ultra
 (80-core GPU), solo runs. **CPU baselines use each case's best measured
 thread count** — on this machine the CPU tally path scales *negatively*
-above ~8 threads (atomic contention on tally bins: Godiva with tallies
-runs 1.70M/s at 4 threads but 0.16M/s at 28), so all-cores numbers
-flatter the GPU misleadingly. An x86_64 build of the same tree running
-under Rosetta 2 is included as the migration baseline.
+above ~8 threads on the *original* code (the shared-global atomic
+contention documented in PORT_NOTES, since fixed on this branch — with
+per-thread accumulators Godiva now scales to 4.7M/s at 16 threads). The
+GPU-vs-CPU tables below predate that fix and quote each case's best
+*original* thread count; they understate the CPU and will be regenerated.
+An x86_64 build under Rosetta 2 is included as the migration baseline.
 
 | Case | particles/batch | CPU best (native arm64) | CPU best (x86_64 under Rosetta) | GPU | GPU vs native | GPU vs Rosetta |
 |---|---|---|---|---|---|---|
@@ -148,6 +150,30 @@ GPU throughput improves with larger `particles` per batch (the GPU is
 under-occupied below ~10^5 particles in flight). Practical CPU tip
 independent of the GPU: on many-core Apple Silicon, run tallied problems
 at 4–8 OpenMP threads, not all cores.
+
+## Fixed-source deep-penetration performance (CP-shield benchmark)
+
+`tools/metal-validation/bench_cp_shield.py` runs the 60 cm shield slab
+(the PROCESS-audit workload) and gates every result against a frozen fp64
+CPU reference. On an M3 Ultra, best-thread CPU baseline:
+
+| material | GPU (60-cell) | GPU (mesh tally) | x vs CPU 8-thread |
+|---|---|---|---|
+| W | 2.28 M/s | 2.54 M/s | 8.3-9.2x |
+| WC+H2O | 2.24 M/s | — | 6.9x |
+| W2B5 | 4.93 M/s | 4.85 M/s | 10.2-10.3x |
+| W2B5+H2O | 4.36 M/s | — | 7.4x |
+
+Up from 1.3-2.6 M/s (4.3-5.4x) before the optimization pass. The wins:
+runtime kernel specialization of per-thread array bounds; a
+cross-section cache across non-collision events; surface-adjacency cell
+relocation on crossings (replacing a full-universe scan that was ~half
+the device time on a 60-cell slab); asynchronous dispatch overlapping
+the next fixed-source batch's host sampling with the kernel; and, in
+`--mesh` mode, tracklength mesh tallies (a `raytrace_mesh` port) that let
+the geometry collapse to a single shield cell. All results remain
+statistically identical to the CPU reference (gate: |mean z| < 1, RMS z
+< 1.5, max |z| < 4.5 over 60 depth bins).
 
 ## Architecture
 

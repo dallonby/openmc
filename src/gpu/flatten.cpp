@@ -22,6 +22,8 @@
 #include "openmc/tallies/filter_cell.h"
 #include "openmc/tallies/filter_energy.h"
 #include "openmc/tallies/filter_material.h"
+#include "openmc/tallies/filter_mesh.h"
+#include "openmc/mesh.h"
 #include "openmc/tallies/filter_universe.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/universe.h"
@@ -554,6 +556,45 @@ bool flatten_tallies(FlatModel& m)
         fd.type = GPU_FILTER_ENERGY;
         fd.n_bins = (uint32_t)ef->bins().size() - 1;
         fd.map_off = push_f32(m, ef->bins().data(), ef->bins().size());
+      } else if (auto* mf = dynamic_cast<const MeshFilter*>(f)) {
+        if (mf->translated() || mf->rotated())
+          return reject(m,
+            fmt::format("tally {} has a translated/rotated mesh filter "
+                        "(unsupported in GPU v1)",
+              t->id()));
+        const auto* rm =
+          dynamic_cast<const RegularMesh*>(model::meshes[mf->mesh()].get());
+        if (!rm)
+          return reject(m,
+            fmt::format("tally {} uses a non-regular mesh (unsupported in "
+                        "GPU v1)",
+              t->id()));
+        GpuMesh gm {};
+        gm.n_dim = rm->n_dimension_;
+        int sh[3] = {1, 1, 1};
+        double ll[3] = {0, 0, 0}, ur[3] = {0, 0, 0}, w[3] = {1, 1, 1};
+        for (int k = 0; k < gm.n_dim; ++k) {
+          sh[k] = rm->shape_[k];
+          ll[k] = rm->lower_left_[k];
+          ur[k] = rm->upper_right_[k];
+          w[k] = rm->width_[k];
+        }
+        gm.nx = sh[0];
+        gm.ny = sh[1];
+        gm.nz = sh[2];
+        gm.llx = (float)ll[0];
+        gm.lly = (float)ll[1];
+        gm.llz = (float)ll[2];
+        gm.urx = (float)ur[0];
+        gm.ury = (float)ur[1];
+        gm.urz = (float)ur[2];
+        gm.wx = (float)w[0];
+        gm.wy = (float)w[1];
+        gm.wz = (float)w[2];
+        fd.type = GPU_FILTER_MESH;
+        fd.n_bins = (uint32_t)(sh[0] * sh[1] * sh[2]);
+        fd.mesh = (int32_t)m.meshes.size();
+        m.meshes.push_back(gm);
       } else {
         return reject(
           m, fmt::format("tally {} has a filter type outside the GPU v1 "

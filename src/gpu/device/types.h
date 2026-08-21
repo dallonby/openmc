@@ -181,10 +181,12 @@ struct GpuFilterDesc {
   int32_gpu mesh;     // mesh filter: index into meshes array, else -1
 };
 
-struct GpuMesh { // regular structured mesh
-  int32_gpu nx, ny, nz;
-  float llx, lly, llz;
-  float wx, wy, wz; // element width
+struct GpuMesh { // RegularMesh, untranslated/unrotated (flatten rejects others)
+  int32_gpu n_dim;      // 1..3 (bin layout follows StructuredMesh::get_bin_from_indices)
+  int32_gpu nx, ny, nz; // shape (1 for unused dimensions)
+  float llx, lly, llz;  // lower_left
+  float urx, ury, urz;  // upper_right (cast from fp64; edge rules compare to it)
+  float wx, wy, wz;     // element width
 };
 
 // Filters per tally are bounded so the device can enumerate every

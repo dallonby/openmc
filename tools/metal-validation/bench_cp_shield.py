@@ -105,15 +105,23 @@ MATERIALS = {
 GATES = {"mean_z": 1.0, "rms_z": 1.5, "max_z": 4.5, "slope_sigma": 5.0, "slope_pct_per_cm": 0.03}
 
 
-def build_model(tag, particles, batches, seed):
+def build_model(tag, particles, batches, seed, mesh=False):
     mat = MATERIALS[tag]()
     dx = T_SHIELD * 100 / N_BINS
-    planes = [openmc.XPlane(i * dx) for i in range(N_BINS + 1)]
     x_front = openmc.XPlane(-5.0, boundary_type="vacuum")
     x_back = openmc.XPlane(T_SHIELD * 100 + 5.0, boundary_type="vacuum")
-    src_cell = openmc.Cell(region=+x_front & -planes[0])
-    depth = [openmc.Cell(fill=mat, region=+planes[i] & -planes[i + 1]) for i in range(N_BINS)]
-    back = openmc.Cell(region=+planes[N_BINS] & -x_back)
+    if mesh:
+        # the audit's original layout: ONE shield cell, depth binning by a
+        # regular mesh tally (tracklength track splitting on the device)
+        x0, x1 = openmc.XPlane(0.0), openmc.XPlane(T_SHIELD * 100)
+        src_cell = openmc.Cell(region=+x_front & -x0)
+        depth = [openmc.Cell(fill=mat, region=+x0 & -x1)]
+        back = openmc.Cell(region=+x1 & -x_back)
+    else:
+        planes = [openmc.XPlane(i * dx) for i in range(N_BINS + 1)]
+        src_cell = openmc.Cell(region=+x_front & -planes[0])
+        depth = [openmc.Cell(fill=mat, region=+planes[i] & -planes[i + 1]) for i in range(N_BINS)]
+        back = openmc.Cell(region=+planes[N_BINS] & -x_back)
     geom = openmc.Geometry([src_cell] + depth + [back])
 
     st = openmc.Settings()
@@ -130,7 +138,14 @@ def build_model(tag, particles, batches, seed):
     src.energy = openmc.stats.Discrete([14.06e6], [1.0])
     st.source = src
 
-    cf = openmc.CellFilter(depth)
+    if mesh:
+        rm = openmc.RegularMesh()
+        rm.dimension = [N_BINS, 1, 1]
+        rm.lower_left = [0.0, -1e4, -1e4]
+        rm.upper_right = [T_SHIELD * 100, 1e4, 1e4]
+        cf = openmc.MeshFilter(rm)
+    else:
+        cf = openmc.CellFilter(depth)
     t_fast = openmc.Tally(name="fast_flux")
     t_fast.filters = [cf, openmc.EnergyFilter([1.0e5, 20.0e6])]
     t_fast.scores = ["flux"]
@@ -224,6 +239,8 @@ def main():
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--reference", default=str(Path(__file__).parent / "reference" / "cp_shield_cpu_fp64_1e8.json"))
     ap.add_argument("--label", default="run")
+    ap.add_argument("--mesh", action="store_true",
+                    help="one shield cell + regular-mesh depth tally instead of 60 cells")
     a = ap.parse_args()
 
     openmc.config["cross_sections"] = a.xs
@@ -243,7 +260,7 @@ def main():
     any_fail = False
     for tag in a.materials.split(","):
         for cfg_name, particles, batches in configs:
-            model = build_model(tag, particles, batches, a.seed)
+            model = build_model(tag, particles, batches, a.seed, mesh=a.mesh)
             case_dir = out / f"{tag}_{cfg_name.replace('=', '')}"
             r = run_case(model, case_dir, use_gpu)
             g = gate(r["profiles"], ref[tag], ref[tag]["x_cm"])

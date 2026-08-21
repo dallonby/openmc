@@ -31,15 +31,23 @@ ENDF/B-VIII.0, against CPU OpenMC built from this same tree.
    `SIZE_MAX`) and reads entries into `int`, testing `< 0`). Correct only
    through the narrowing wraparound; worth an `int32_t` cleanup upstream.
 
-3. **CPU tally scoring collapses above ~8 threads on Apple Silicon**
-   (observation, not a fork change): with ~50 tally bins, Godiva runs
-   1.70M/s at 4 threads, 1.17M at 8, 0.31M at 16, 0.15M at 28 — the
-   `#pragma omp atomic` tally accumulation cache-line ping-pongs, likely
-   compounded by libomp scheduling across P+E cores. Without tallies,
-   28 threads still only reaches 0.98M/s vs 0.80M single-threaded.
-   Reported CPU baselines in README_METAL.md therefore use each case's
-   best thread count. Possibly worth per-thread tally buffers upstream on
-   many-core targets.
+3. **CPU throughput collapsed above ~8 threads on Apple Silicon —
+   root-caused and fixed on this branch.** The cause was NOT the tally
+   bins but the per-particle `#pragma omp atomic` updates of shared
+   globals: `simulation::total_weight` at the start of every history
+   (`initialize_particle_track`) and the four `global_tally_*` keff
+   accumulators at the end (`Particle::event_death`). On the two-die M3
+   Ultra those serialize every history across all cores; a 28-thread
+   `sample` profile showed exactly those frames dominating. The fix
+   (`src/particle.cpp`) accumulates into cache-line-padded (`alignas(64)`)
+   per-thread slots and flushes them into the globals once per generation
+   (`flush_thread_accumulators`). Godiva with tallies went from 1.74M/s
+   at 16 threads / 0.81M/s at 28 to 4.69M/s / 3.92M/s, results
+   bit-identical (k and every tally bin unchanged to the last digit).
+   This is a strong upstream candidate for many-core hosts. A smaller
+   residual (16 -> 28 threads still droops slightly) is the remaining
+   per-score tally atomics; threadgroup/thread-local tally tiles are the
+   next step.
 
 4. **The event-based queue sort is dead code** (`src/event.cpp:81` —
    commented out pending TBB); `EventQueueItem::operator<` exists and works.

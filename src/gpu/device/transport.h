@@ -55,6 +55,88 @@ struct GpuTallyView {
   uint32_gpu n_tallies;
 };
 
+// ---- RegularMesh helpers (StructuredMesh semantics: 1-based ijk) ----
+DEVICE_FN int32_gpu gpu_mesh_index_dir(
+  float r, float ll, float ur, float w, int32_gpu shape)
+{
+  if (r <= ll)
+    return (r == ll) ? 1 : 0;
+  if (r >= ur)
+    return (r == ur) ? shape : shape + 1;
+  return (int32_gpu)ceilf((r - ll) / w);
+}
+
+//! get_indices: 1-based indices; returns in_mesh
+DEVICE_FN bool gpu_mesh_indices(GpuMesh m, GpuVec3 r, THREAD int32_gpu* ijk)
+{
+  bool in = true;
+  ijk[0] = gpu_mesh_index_dir(r.x, m.llx, m.urx, m.wx, m.nx);
+  if (ijk[0] < 1 || ijk[0] > m.nx)
+    in = false;
+  ijk[1] = 1;
+  ijk[2] = 1;
+  if (m.n_dim >= 2) {
+    ijk[1] = gpu_mesh_index_dir(r.y, m.lly, m.ury, m.wy, m.ny);
+    if (ijk[1] < 1 || ijk[1] > m.ny)
+      in = false;
+  }
+  if (m.n_dim >= 3) {
+    ijk[2] = gpu_mesh_index_dir(r.z, m.llz, m.urz, m.wz, m.nz);
+    if (ijk[2] < 1 || ijk[2] > m.nz)
+      in = false;
+  }
+  return in;
+}
+
+DEVICE_FN int32_gpu gpu_mesh_bin(GpuMesh m, THREAD const int32_gpu* ijk)
+{
+  if (m.n_dim == 1)
+    return ijk[0] - 1;
+  if (m.n_dim == 2)
+    return (ijk[1] - 1) * m.nx + ijk[0] - 1;
+  return ((ijk[2] - 1) * m.ny + (ijk[1] - 1)) * m.nx + ijk[0] - 1;
+}
+
+DEVICE_FN float gpu_mesh_ll(GpuMesh m, int k)
+{
+  return k == 0 ? m.llx : (k == 1 ? m.lly : m.llz);
+}
+DEVICE_FN float gpu_mesh_w(GpuMesh m, int k)
+{
+  return k == 0 ? m.wx : (k == 1 ? m.wy : m.wz);
+}
+DEVICE_FN int32_gpu gpu_mesh_shape(GpuMesh m, int k)
+{
+  return k == 0 ? m.nx : (k == 1 ? m.ny : m.nz);
+}
+DEVICE_FN float gpu_vec_comp(GpuVec3 v, int k)
+{
+  return k == 0 ? v.x : (k == 1 ? v.y : v.z);
+}
+
+//! RegularMesh::distance_to_grid_boundary (distance measured from the track
+//! start r0, as on the CPU); returns distance, writes next index
+DEVICE_FN float gpu_mesh_dist(GpuMesh m, THREAD const int32_gpu* ijk, int k,
+  GpuVec3 r0, GpuVec3 u, THREAD int32_gpu* next)
+{
+  *next = ijk[k];
+  float uk = gpu_vec_comp(u, k);
+  if (uk == 0.0f)
+    return GPU_INFTY;
+  float ll = gpu_mesh_ll(m, k), w = gpu_mesh_w(m, k);
+  int32_gpu sh = gpu_mesh_shape(m, k);
+  if (uk > 0.0f) {
+    if (ijk[k] <= sh) {
+      *next = ijk[k] + 1;
+      return (ll + (float)ijk[k] * w - gpu_vec_comp(r0, k)) / uk;
+    }
+  } else if (ijk[k] >= 1) {
+    *next = ijk[k] - 1;
+    return (ll + (float)(ijk[k] - 1) * w - gpu_vec_comp(r0, k)) / uk;
+  }
+  return GPU_INFTY;
+}
+
 //! Match one filter. Writes every matching bin (cell/universe filters can
 //! match at several coordinate levels — CPU get_all_bins pushes them all
 //! and FilterBinIter scores the cartesian product) and returns the count;
@@ -107,42 +189,105 @@ DEVICE_FN int32_gpu gpu_filter_match(GpuTallyView tv, GpuFilterDesc f,
     return 1;
   }
   case GPU_FILTER_MESH: {
-    // Point sample at the current position: exact for the collision
-    // estimator only. Tracklength mesh tallies need CPU-style track
-    // splitting, so flatten rejects mesh filters (dead path, kept for the
-    // future event-based port).
+    // point sample (collision estimator; MeshFilter::get_all_bins ->
+    // get_bin). Tracklength mesh tallies are scored by track splitting in
+    // gpu_score_tallies instead.
     GpuMesh mesh = tv.meshes[f.mesh];
-    GpuVec3 r = gs->coord[0].r;
-    int32_gpu i = (int32_gpu)floorf((r.x - mesh.llx) / mesh.wx);
-    int32_gpu j = (int32_gpu)floorf((r.y - mesh.lly) / mesh.wy);
-    int32_gpu k = (int32_gpu)floorf((r.z - mesh.llz) / mesh.wz);
-    if (i < 0 || i >= mesh.nx || j < 0 || j >= mesh.ny || k < 0 || k >= mesh.nz)
+    int32_gpu ijk[3];
+    if (!gpu_mesh_indices(mesh, gs->coord[0].r, ijk))
       return 0;
-    bins[0] = mesh.nx * mesh.ny * k + mesh.nx * j + i;
+    bins[0] = gpu_mesh_bin(mesh, ijk);
     return 1;
   }
   }
   return 0;
 }
 
+//! Score one (coeff, filter-combination set) into a tally: every
+//! combination of the per-filter match lists (CPU FilterBinIter).
+DEVICE_FN void gpu_score_combos(GpuTallyView tv, GpuTallyDesc td,
+  THREAD const int32_gpu* fbins, THREAD const int32_gpu* fcnt, float coeff,
+  GpuMacroXS xs, float scat, float elastic)
+{
+  int32_gpu idx[GPU_MAX_TALLY_FILTERS];
+  for (uint32_gpu fi = 0; fi < td.n_filters; ++fi)
+    idx[fi] = 0;
+  for (;;) {
+    int32_gpu flat = 0;
+    for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
+      GpuFilterDesc f = tv.filters[td.filter_off + fi];
+      flat += fbins[fi * GPU_MAX_COORD + idx[fi]] * (int32_gpu)f.stride;
+    }
+    for (uint32_gpu s = 0; s < td.n_scores; ++s) {
+      int32_gpu code = tv.i32[td.score_off + s];
+      float val;
+      switch (code) {
+      case GPU_SCORE_FLUX:
+        val = coeff;
+        break;
+      case GPU_SCORE_TOTAL:
+        val = coeff * xs.total;
+        break;
+      case GPU_SCORE_ABSORPTION:
+        val = coeff * xs.absorption;
+        break;
+      case GPU_SCORE_FISSION:
+        val = coeff * xs.fission;
+        break;
+      case GPU_SCORE_NU_FISSION:
+        val = coeff * xs.nu_fission;
+        break;
+      case GPU_SCORE_SCATTER:
+        val = coeff * scat;
+        break;
+      case GPU_SCORE_ELASTIC:
+        val = coeff * elastic;
+        break;
+      default:
+        val = 0.0f;
+        break;
+      }
+      if (val != 0.0f) {
+        gpu_atomic_add_f(
+          tv.accum + td.accum_off + (uint32_gpu)flat * td.n_scores + s, val);
+      }
+    }
+    // odometer over the per-filter match lists
+    int32_gpu fi = (int32_gpu)td.n_filters - 1;
+    for (; fi >= 0; --fi) {
+      if (++idx[fi] < fcnt[fi])
+        break;
+      idx[fi] = 0;
+    }
+    if (fi < 0)
+      break;
+  }
+}
+
 //! Score all tallies of the given estimator for one event.
 //! coeff: tracklength -> wgt * distance; collision -> wgt / Sigma_t.
+//! r0/u/dist describe the flight (tracklength) for mesh track splitting.
 //! Macroscopic score values are supplied by the caller (mode-specific).
-//! Every combination of per-filter matches is scored (CPU FilterBinIter).
 DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
   uint32_gpu estimator, float coeff, float E, GpuMacroXS xs, float scat,
-  float elastic)
+  float elastic, GpuVec3 r0, GpuVec3 u, float dist)
 {
   for (uint32_gpu t = 0; t < tv.n_tallies; ++t) {
     GpuTallyDesc td = tv.tallies[t];
     if (td.estimator != estimator)
       continue;
-    int32_gpu fbins[GPU_MAX_TALLY_FILTERS][GPU_MAX_COORD];
+    int32_gpu fbins[GPU_MAX_TALLY_FILTERS * GPU_MAX_COORD];
     int32_gpu fcnt[GPU_MAX_TALLY_FILTERS];
+    int32_gpu mesh_fi = -1;
     bool miss = false;
     for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
       GpuFilterDesc f = tv.filters[td.filter_off + fi];
-      fcnt[fi] = gpu_filter_match(tv, f, gs, E, fbins[fi]);
+      if (f.type == GPU_FILTER_MESH && estimator == GPU_ESTIMATOR_TRACKLENGTH) {
+        mesh_fi = (int32_gpu)fi; // filled per track segment below
+        fcnt[fi] = 1;
+        continue;
+      }
+      fcnt[fi] = gpu_filter_match(tv, f, gs, E, fbins + fi * GPU_MAX_COORD);
       if (fcnt[fi] == 0) {
         miss = true;
         break;
@@ -150,58 +295,70 @@ DEVICE_FN void gpu_score_tallies(GpuTallyView tv, THREAD const GpuGeomState* gs,
     }
     if (miss)
       continue;
-    int32_gpu idx[GPU_MAX_TALLY_FILTERS];
-    for (uint32_gpu fi = 0; fi < td.n_filters; ++fi)
-      idx[fi] = 0;
-    for (;;) {
-      int32_gpu flat = 0;
-      for (uint32_gpu fi = 0; fi < td.n_filters; ++fi) {
-        GpuFilterDesc f = tv.filters[td.filter_off + fi];
-        flat += fbins[fi][idx[fi]] * (int32_gpu)f.stride;
+    if (mesh_fi < 0) {
+      gpu_score_combos(tv, td, fbins, fcnt, coeff, xs, scat, elastic);
+      continue;
+    }
+
+    // ---- tracklength mesh filter: StructuredMesh::raytrace_mesh port ----
+    GpuMesh m = tv.meshes[tv.filters[td.filter_off + mesh_fi].mesh];
+    float total = dist;
+    if (total <= 0.0f)
+      continue;
+    int32_gpu ijk[3];
+    bool in_mesh = gpu_mesh_indices(
+      m, gpu_add(r0, gpu_scale(u, GPU_TINY_BIT)), ijk);
+    if (total < 2.0f * GPU_TINY_BIT) {
+      if (in_mesh) {
+        fbins[mesh_fi * GPU_MAX_COORD] = gpu_mesh_bin(m, ijk);
+        gpu_score_combos(tv, td, fbins, fcnt, coeff, xs, scat, elastic);
       }
-      for (uint32_gpu s = 0; s < td.n_scores; ++s) {
-        int32_gpu code = tv.i32[td.score_off + s];
-        float val;
-        switch (code) {
-        case GPU_SCORE_FLUX:
-          val = coeff;
-          break;
-        case GPU_SCORE_TOTAL:
-          val = coeff * xs.total;
-          break;
-        case GPU_SCORE_ABSORPTION:
-          val = coeff * xs.absorption;
-          break;
-        case GPU_SCORE_FISSION:
-          val = coeff * xs.fission;
-          break;
-        case GPU_SCORE_NU_FISSION:
-          val = coeff * xs.nu_fission;
-          break;
-        case GPU_SCORE_SCATTER:
-          val = coeff * scat;
-          break;
-        case GPU_SCORE_ELASTIC:
-          val = coeff * elastic;
-          break;
-        default:
-          val = 0.0f;
-          break;
+      continue;
+    }
+    float dk[3];
+    int32_gpu nk[3];
+    int nd = m.n_dim;
+    for (int k = 0; k < nd; ++k)
+      dk[k] = gpu_mesh_dist(m, ijk, k, r0, u, &nk[k]);
+    float traveled = 0.0f;
+    int32_gpu guard = 4 * (m.nx + m.ny + m.nz) + 16;
+    while (guard-- > 0) {
+      if (in_mesh) {
+        int kmin = 0;
+        for (int k = 1; k < nd; ++k)
+          if (dk[k] < dk[kmin])
+            kmin = k;
+        float seg_end = fminf(dk[kmin], total);
+        float frac = (seg_end - traveled) / total;
+        if (frac > 0.0f) {
+          fbins[mesh_fi * GPU_MAX_COORD] = gpu_mesh_bin(m, ijk);
+          gpu_score_combos(
+            tv, td, fbins, fcnt, coeff * frac, xs, scat, elastic);
         }
-        if (val != 0.0f) {
-          gpu_atomic_add_f(
-            tv.accum + td.accum_off + (uint32_gpu)flat * td.n_scores + s, val);
-        }
-      }
-      // odometer over the per-filter match lists
-      int32_gpu fi = (int32_gpu)td.n_filters - 1;
-      for (; fi >= 0; --fi) {
-        if (++idx[fi] < fcnt[fi])
+        traveled = dk[kmin];
+        if (traveled >= total)
           break;
-        idx[fi] = 0;
+        ijk[kmin] = nk[kmin];
+        dk[kmin] = gpu_mesh_dist(m, ijk, kmin, r0, u, &nk[kmin]);
+        in_mesh = (ijk[kmin] >= 1 && ijk[kmin] <= gpu_mesh_shape(m, kmin));
+      } else {
+        int kmax = -1;
+        for (int k = 0; k < nd; ++k) {
+          if ((ijk[k] < 1 || ijk[k] > gpu_mesh_shape(m, k)) &&
+              dk[k] > traveled) {
+            traveled = dk[k];
+            kmax = k;
+          }
+        }
+        if (kmax == -1)
+          traveled += GPU_TINY_BIT;
+        if (traveled >= total)
+          break;
+        in_mesh = gpu_mesh_indices(
+          m, gpu_add(r0, gpu_scale(u, traveled + GPU_TINY_BIT)), ijk);
+        for (int k = 0; k < nd; ++k)
+          dk[k] = gpu_mesh_dist(m, ijk, k, r0, u, &nk[k]);
       }
-      if (fi < 0)
-        break;
     }
   }
 }
@@ -480,6 +637,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           banks.trace[ti].c = E;
         }
       }
+      GpuVec3 r_flight0 = gs.coord[0].r; // track start (mesh tallies)
       gpu_move_distance(&gs, distance);
       if (is_ce) {
         time += distance / gpu_neutron_speed(E);
@@ -519,7 +677,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                              ? xs
                              : gpu_mg_score_xs(mg, gs.material, g, xs);
         gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_TRACKLENGTH, wgt * distance, E,
-          xs_sc, mac_scat, mac_elastic);
+          xs_sc, mac_scat, mac_elastic, r_flight0, gs.coord[0].u, distance);
       }
       if (distance > GPU_TINY_BIT)
         gs.surface = GPU_SURFACE_NONE;
@@ -647,7 +805,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           GpuMacroXS xs_sc =
             is_ce ? xs : gpu_mg_score_xs(mg, gs.material, g, xs);
           gpu_score_tallies(tv, &gs, GPU_ESTIMATOR_COLLISION, wgt / xs.total, E,
-            xs_sc, mac_scat, mac_elastic);
+            xs_sc, mac_scat, mac_elastic, gs.coord[0].r, gs.coord[0].u, 0.0f);
         }
 
         if (is_ce) {

@@ -122,60 +122,38 @@ the Metal engine now reproduces the host-compiled engine's leak outcome
 
 ## Performance
 
-Active-batch calculation rates with tallies enabled on an M3 Ultra
-(80-core GPU), solo runs. **CPU baselines use each case's best measured
-thread count** — on this machine the CPU tally path scales *negatively*
-above ~8 threads on the *original* code (the shared-global atomic
-contention documented in PORT_NOTES, since fixed on this branch — with
-per-thread accumulators Godiva now scales to 4.7M/s at 16 threads). The
-GPU-vs-CPU tables below predate that fix and quote each case's best
-*original* thread count; they understate the CPU and will be regenerated.
-An x86_64 build under Rosetta 2 is included as the migration baseline.
+Active-batch calculation rates on an M3 Ultra (80-core GPU), current
+build, each row a **single model run on both engines** (no cross-problem
+comparisons). CPU rates are the best over a thread sweep; the "fixed CPU"
+column reflects the per-thread-accumulator fix (PORT_NOTES finding 3).
 
-| Case | particles/batch | CPU best (native arm64) | CPU best (x86_64 under Rosetta) | GPU | GPU vs native | GPU vs Rosetta |
-|---|---|---|---|---|---|---|
-| MG 7-group pin lattice | 100k | 149k/s (8t) | 115k/s (8t) | 3.11M/s | 21× | 27× |
-| MG 7-group pin lattice | 1M | ~149k/s | ~115k/s | 3.93M/s | 26× | 34× |
-| CE pincell with S(a,b) | 20k | 70k/s (4t) | 60k/s (8t) | 583k/s | 8.3× | 9.7× |
-| CE Godiva (fast) | 100k | 1.70M/s (4t) | 1.24M/s (8t) | 10.2M/s | 6.0× | 8.2× |
-| CE Godiva (fast) | 1M | ~1.70M/s | ~1.24M/s | 10.8M/s | 6.4× | 8.7× |
+| Case | GPU | CPU best (fixed) | GPU speedup | note |
+|---|---|---|---|---|
+| MG 7-group 3×3 lattice, 70 tally bins | 3.25 M/s | 0.156 M/s (8t) | **21×** | CPU still collapses above 8t — the bottleneck here is per-bin tally-scoring atomics, which the accumulator fix does **not** address |
+| CE Godiva (bare sphere, eigenvalue) | 14.9 M/s | 4.69 M/s (16t) | **3.2×** | the accumulator fix removed this CPU cliff, so this is a clean compute-vs-compute ratio |
+| CE tungsten deep-penetration slab (60 cm, fixed source) | 1.71 M/s (60-cell) / 2.54 M/s (mesh tally) | 0.41 M/s (16t) | **4.2× / 6.2×** | the PROCESS-shielding workload |
 
-Rosetta's translation penalty is cleanest single-threaded: native/Rosetta
-per-core throughput is 1.84× (MG), 1.37× (S(a,b) pincell), 1.37×
-(Godiva); at the multi-thread optimum the shared contention bottleneck
-partially masks it (1.16–1.37×). Rosetta runs reproduced native k
-bit-for-bit on MG and Godiva with matched seeds.
+**Read these honestly.** The largest multiples occur where the CPU
+baseline is throttled by atomic contention that the GPU's per-thread
+accumulation avoids — MG (21×) is as much "the CPU still contends on tally
+bins" as "the GPU is fast". Where that contention was removed (Godiva),
+the honest ratio is ~3×, which is closer to the real fp32-GPU-vs-CPU
+compute advantage on these parts. Earlier revisions of this file quoted
+Godiva at 6× against a *contention-crippled* 4-thread CPU baseline; those
+numbers were inflated by a CPU bug since fixed, and are corrected here.
 
-GPU throughput improves with larger `particles` per batch (the GPU is
-under-occupied below ~10^5 particles in flight). Practical CPU tip
-independent of the GPU: on many-core Apple Silicon, run tallied problems
-at 4–8 OpenMP threads, not all cores.
+The GPU wins on every workload measured; the *size* of the win depends on
+how contended the CPU comparison is. Deep-penetration shielding — the
+workload this port was built for — runs 4–6× a properly-tuned CPU, with
+the mesh-tally path (single shield cell + tracklength track splitting) at
+the top of that range.
 
-## Fixed-source deep-penetration performance (CP-shield benchmark)
+The remaining GPU levers (history-length divergence on long tungsten
+walks; the shared tally atomics that also cap the CPU) are the
+event-based/wavefront pipeline and threadgroup-local tally tiles, both on
+the roadmap.
 
-`tools/metal-validation/bench_cp_shield.py` runs the 60 cm shield slab
-(the PROCESS-audit workload) and gates every result against a frozen fp64
-CPU reference. On an M3 Ultra, best-thread CPU baseline:
-
-| material | GPU (60-cell) | GPU (mesh tally) | x vs CPU 8-thread |
-|---|---|---|---|
-| W | 2.28 M/s | 2.54 M/s | 8.3-9.2x |
-| WC+H2O | 2.24 M/s | — | 6.9x |
-| W2B5 | 4.93 M/s | 4.85 M/s | 10.2-10.3x |
-| W2B5+H2O | 4.36 M/s | — | 7.4x |
-
-Up from 1.3-2.6 M/s (4.3-5.4x) before the optimization pass. The wins:
-runtime kernel specialization of per-thread array bounds; a
-cross-section cache across non-collision events; surface-adjacency cell
-relocation on crossings (replacing a full-universe scan that was ~half
-the device time on a 60-cell slab); asynchronous dispatch overlapping
-the next fixed-source batch's host sampling with the kernel; and, in
-`--mesh` mode, tracklength mesh tallies (a `raytrace_mesh` port) that let
-the geometry collapse to a single shield cell. All results remain
-statistically identical to the CPU reference (gate: |mean z| < 1, RMS z
-< 1.5, max |z| < 4.5 over 60 depth bins).
-
-## Architecture
+## Architecture## Architecture
 
 ```
 src/gpu/

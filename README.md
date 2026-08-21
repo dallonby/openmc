@@ -2,8 +2,9 @@
 
 **The first port of the [OpenMC](https://github.com/openmc-dev/openmc)
 Monte Carlo particle transport code to Apple GPUs.** Real continuous-energy
-nuclear data, the real OpenMC code base, one line to enable — and up to
-**26× the throughput of the same machine's best-tuned CPU run**.
+nuclear data, the real OpenMC code base, one line to enable — and
+**3–21× the throughput of the same machine's best-tuned CPU run**
+(honest per-workload numbers below).
 
 ```python
 import openmc
@@ -20,22 +21,28 @@ envelope, and falls back to the CPU with a clear warning when it is not.
 
 ## Performance
 
-Measured on an M3 Ultra (80-core GPU) against **the same machine's best
-CPU configuration** — every baseline uses its measured-best thread count,
-because on many-core Apple Silicon the CPU tally path scales *negatively*
-past ~8 threads and an all-cores baseline would flatter the GPU:
+Measured on an M3 Ultra (80-core GPU), each row a single model run on
+both engines. CPU baselines use the best thread count over a sweep, on
+the current build (with the many-core scaling fix described in
+[PORT_NOTES.md](PORT_NOTES.md) — earlier tables here quoted CPU baselines
+crippled by an atomic-contention bug and overstated the GPU; those are
+corrected below):
 
-| Case | GPU | Best CPU (native arm64) | Speedup |
+| Case | GPU | CPU best | Speedup |
 |---|---|---|---|
-| CE Godiva (fast benchmark), 1M/batch | **10.8M histories/s** | 1.70M/s (4t) | **6.4×** |
-| CE Godiva, no tallies | **16.8M histories/s** | — | — |
-| CE PWR pincell with S(α,β) thermal scattering | **0.60M histories/s** | 70k/s (4t) | **8.6×** |
-| 7-group MG pin lattice, 1M/batch | **3.9M histories/s** | 149k/s (8t) | **26×** |
+| 7-group MG pin lattice (70 tally bins) | **3.25M histories/s** | 0.156M/s (8t) | **21×** |
+| CE Godiva (bare sphere) | **14.9M histories/s** | 4.69M/s (16t) | **3.2×** |
+| CE tungsten deep-penetration slab | **1.7–2.5M histories/s** | 0.41M/s (16t) | **4–6×** |
 
-Against an x86_64 build under Rosetta 2 — the number that matters if you
-are migrating an Intel-era workflow — the same runs are **8–34× faster**.
-The GPU gets faster as batches get bigger (it is under-occupied below
-~10⁵ particles in flight); 400 million Godiva histories take 25 seconds.
+Read these honestly: the biggest multiples land where the CPU is throttled
+by atomic contention the GPU avoids (MG still collapses above 8 threads on
+per-bin tally atomics — a separate, unfixed CPU bottleneck), while on
+Godiva, where that contention was fixed, the honest compute-vs-compute
+ratio is ~3×. The GPU wins on every workload; how much depends on how
+contended the CPU comparison is. The GPU also keeps scaling with batch
+size (400M Godiva histories in 25 s) and has headroom left — an
+event-based pipeline for long divergent histories, and threadgroup-local
+tally tiles, are the next levers.
 
 ## Accuracy
 

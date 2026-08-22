@@ -522,6 +522,7 @@ void transport_generation()
   ctl->ww_checkpoint_surface =
     settings::weight_window_checkpoint_surface ? 1u : 0u;
   ctl->spill_cap = ctl->fission_bank_cap;
+  ctl->source_is_spill = 0u;
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -549,6 +550,10 @@ void transport_generation()
     g.delayed_group = s.delayed_group;
     g.parent_id = 0;
     g.progeny_id = 0;
+    g.seed_track_lo = 0;
+    g.seed_track_hi = 0;
+    g.seed_urr_lo = 0;
+    g.seed_urr_hi = 0;
     g.wgt_born = (float)s.wgt;
     g.wgt_ww_born = -1.0f; // unset: the first window lookup fixes it
     g.ww_factor = 0.0f;
@@ -1165,18 +1170,29 @@ void transport_generation()
       static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
     const int max_passes = 256;
     for (int pass = 0; pass < max_passes; ++pass) {
-      uint32_t spill = ctr0[GPU_CTR_SPILL];
+      uint32_t spill = std::min(ctr0[GPU_CTR_SPILL], ctl->spill_cap);
       if (spill == 0)
         break;
-      uint32_t take = std::min(spill, ctl->spill_cap);
+      // The source buffer holds n sites while the spill bank holds up to
+      // spill_cap (> n), so drain in source-sized chunks and keep the
+      // remainder at the front of the bank for the next pass. The device
+      // appends new spills from the retained count upward, so nothing is
+      // overwritten.
+      const uint32_t src_cap = (uint32_t)n;
+      uint32_t take = std::min(spill, src_cap);
       auto* spill_bank = static_cast<GpuSourceSite*>(
         omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
       auto* src_buf = static_cast<GpuSourceSite*>(
         omg_metal_contents(eng.ctx, OMG_SLOT_SOURCE));
       std::memcpy(src_buf, spill_bank, (size_t)take * sizeof(GpuSourceSite));
-      ctr0[GPU_CTR_SPILL] = 0;
+      uint32_t remain = spill - take;
+      if (remain > 0)
+        std::memmove(spill_bank, spill_bank + take,
+          (size_t)remain * sizeof(GpuSourceSite));
+      ctr0[GPU_CTR_SPILL] = remain;
       ctl->n_particles = take;
       ctl->source_offset = 0;
+      ctl->source_is_spill = 1u;
       std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS), 0,
         (size_t)take * GPU_RED_WIDTH * 4);
       if (omg_metal_dispatch_async(
@@ -1242,9 +1258,16 @@ void transport_generation()
     }
   }
   if (ctr[GPU_CTR_SPILL_DROP] > 0) {
+    // Not a correctness problem: when the bank is full the device makes
+    // fewer split copies and the parent keeps the remaining weight, so
+    // totals are conserved. It does mean the weight windows are asking for
+    // more splitting than the bank can hold, i.e. weaker variance
+    // reduction than requested.
     warning(fmt::format(
-      "GPU dropped {} secondaries: the spill bank ({} sites) was full. "
-      "Increase it or soften the weight windows.",
+      "GPU weight windows requested {} more split copies than the spill bank "
+      "({} sites) could hold; those splits were declined (weight conserved, "
+      "results unbiased, variance reduction weaker than requested). Soften "
+      "the windows or lower max_split.",
       ctr[GPU_CTR_SPILL_DROP], ctl->spill_cap));
   }
   if (ctr[GPU_CTR_SECONDARY_BANK] > 0) {

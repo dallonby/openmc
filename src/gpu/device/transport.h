@@ -650,10 +650,12 @@ DEVICE_FN bool gpu_ww_lookup(GCONST GpuControl& ctl, GpuTallyView tv, float E,
 }
 
 //! Push one secondary: per-thread stack first, then the global spill bank.
-DEVICE_FN void gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
+//! Returns false when neither had room (the caller must then conserve
+//! weight itself — see gpu_apply_weight_window).
+DEVICE_FN bool gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
   THREAD GpuSecondary* sec_stack, THREAD int32_gpu* n_stack,
   THREAD const GpuVrState* vr, GpuVec3 r, GpuVec3 u, float E, float wgt,
-  float time)
+  float time, THREAD const uint64_gpu* seeds)
 {
   if (*n_stack < GPU_MAX_SECONDARY_STACK) {
     THREAD GpuSecondary* sc = &sec_stack[(*n_stack)++];
@@ -666,12 +668,12 @@ DEVICE_FN void gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
     sc->E = E;
     sc->wgt = wgt;
     sc->time = time;
-    return;
+    return true;
   }
   uint32_gpu idx = gpu_atomic_add_u32(banks.counters + GPU_CTR_SPILL, 1u);
   if (idx >= ctl.spill_cap) {
     gpu_atomic_add_u32(banks.counters + GPU_CTR_SPILL_DROP, 1u);
-    return;
+    return false;
   }
   GpuSourceSite site;
   site.r[0] = r.x;
@@ -690,7 +692,16 @@ DEVICE_FN void gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
   site.wgt_ww_born = vr->wgt_ww_born;
   site.ww_factor = vr->ww_factor;
   site.n_split = vr->n_split;
+  // carry the parent's stream so the child continues it rather than
+  // replaying some primary particle's sequence
+  uint64_gpu st = seeds[GPU_STREAM_TRACKING];
+  uint64_gpu su = seeds[GPU_STREAM_URR_PTABLE];
+  site.seed_track_lo = (uint32_gpu)(st & 0xffffffffu);
+  site.seed_track_hi = (uint32_gpu)(st >> 32);
+  site.seed_urr_lo = (uint32_gpu)(su & 0xffffffffu);
+  site.seed_urr_hi = (uint32_gpu)(su >> 32);
   banks.fission[idx] = site;
+  return true;
 }
 
 //! russian_roulette (physics_common.cpp)
@@ -708,7 +719,7 @@ DEVICE_FN void gpu_russian_roulette(
 DEVICE_FN void gpu_apply_weight_window(GCONST GpuControl& ctl, GpuTallyView tv,
   GpuBanks banks, THREAD GpuSecondary* sec_stack, THREAD int32_gpu* n_stack,
   THREAD GpuVrState* vr, GpuVec3 r, GpuVec3 u, float E, float time,
-  THREAD float* wgt, THREAD uint64_gpu* seed)
+  THREAD float* wgt, THREAD uint64_gpu* seeds)
 {
   if (*wgt <= 0.0f || E <= 0.0f)
     return;
@@ -751,15 +762,24 @@ DEVICE_FN void gpu_apply_weight_window(GCONST GpuControl& ctl, GpuTallyView tv,
     vr->n_split += (int32_gpu)n_split;
     float w_each = weight / n_split;
     int32_gpu i_split = (int32_gpu)(n_split + 0.5f);
-    for (int32_gpu l = 0; l < i_split - 1; ++l)
-      gpu_push_secondary(
-        ctl, banks, sec_stack, n_stack, vr, r, u, E, w_each, time);
-    *wgt = w_each;
+    // Splitting is optional: if the stack and spill bank are both full we
+    // simply make FEWER copies and the parent keeps the weight the missing
+    // copies would have carried. Total weight is conserved exactly, so the
+    // estimator stays unbiased — only the variance reduction is weaker.
+    // (Dropping an already-divided copy, by contrast, destroys weight and
+    // biases the tally low; that is what this avoids.)
+    int32_gpu made = 0;
+    for (int32_gpu l = 0; l < i_split - 1; ++l) {
+      if (gpu_push_secondary(
+            ctl, banks, sec_stack, n_stack, vr, r, u, E, w_each, time, seeds))
+        ++made;
+    }
+    *wgt = weight - (float)made * w_each;
   } else if (weight < lower * (1.0f - GPU_WW_REL_TOL)) {
     float ws = weight * (float)ctl.ww_max_split;
     if (survival < ws)
       ws = survival;
-    gpu_russian_roulette(wgt, ws, seed);
+    gpu_russian_roulette(wgt, ws, &seeds[GPU_STREAM_TRACKING]);
   }
 }
 
@@ -773,8 +793,18 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   int64_gpu index_source = (int64_gpu)(ctl.source_offset + tid) + 1;
 
   uint64_gpu seeds[GPU_N_STREAMS];
-  gpu_init_particle_seeds((int64_gpu)ctl.seed_base + index_source,
-    ctl.master_seed, ctl.prn_stride, seeds);
+  if (ctl.source_is_spill) {
+    // a spilled secondary resumes its parent's stream (see GpuSourceSite)
+    for (int i = 0; i < GPU_N_STREAMS; ++i)
+      seeds[i] = 0;
+    seeds[GPU_STREAM_TRACKING] = ((uint64_gpu)src.seed_track_hi << 32) |
+                                 (uint64_gpu)src.seed_track_lo;
+    seeds[GPU_STREAM_URR_PTABLE] =
+      ((uint64_gpu)src.seed_urr_hi << 32) | (uint64_gpu)src.seed_urr_lo;
+  } else {
+    gpu_init_particle_seeds((int64_gpu)ctl.seed_base + index_source,
+      ctl.master_seed, ctl.prn_stride, seeds);
+  }
   int stream = GPU_STREAM_TRACKING;
 
   GpuGeomState gs;
@@ -1096,7 +1126,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             // weight-window surface checkpoint (particle.cpp:400)
             if (ctl.ww_on && ctl.ww_checkpoint_surface && wgt > 0.0f) {
               gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
-                gs.coord[0].r, gs.coord[0].u, E, time, &wgt, &seeds[stream]);
+                gs.coord[0].r, gs.coord[0].u, E, time, &wgt, seeds);
               if (wgt <= 0.0f)
                 break;
             }
@@ -1438,10 +1468,18 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                 // rejects secondaries below the energy cutoff at creation
                 if (floorf(y) == y && y > 0.0f && E >= ctl.energy_cutoff) {
                   int32_gpu extra = (int32_gpu)(y + 0.5f) - 1;
+                  int32_gpu missed = 0;
                   for (int32_gpu q = 0; q < extra; ++q) {
                     if (ctl.run_mode == GPU_RUN_FIXED_SOURCE) {
-                      gpu_push_secondary(ctl, banks, sec_stack, &n_stack, &vr,
-                        gs.coord[0].r, gs.coord[0].u, E, wgt, time);
+                      // if the banks are full, fall back to implicit
+                      // multiplication: the parent carries the weight of the
+                      // clones that could not be created (the same treatment
+                      // OpenMC uses for non-integer yields), so weight is
+                      // conserved instead of a real neutron being lost
+                      if (!gpu_push_secondary(ctl, banks, sec_stack, &n_stack,
+                            &vr, gs.coord[0].r, gs.coord[0].u, E, wgt, time,
+                            seeds))
+                        ++missed;
                     } else if (n_stack < GPU_MAX_SECONDARY_STACK) {
                       THREAD GpuSecondary* sc = &sec_stack[n_stack++];
                       sc->r[0] = gs.coord[0].r.x;
@@ -1458,6 +1496,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                         banks.counters + GPU_CTR_SECONDARY_BANK, 1u);
                     }
                   }
+                  if (missed > 0)
+                    wgt *= (float)(missed + 1);
                 } else {
                   wgt *= y;
                 }
@@ -1557,7 +1597,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
         if (wgt > 0.0f) {
           if (ctl.ww_on && ctl.ww_checkpoint_collision) {
             gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
-              gs.coord[0].r, gs.coord[0].u, E, time, &wgt, &seeds[stream]);
+              gs.coord[0].r, gs.coord[0].u, E, time, &wgt, seeds);
           } else if (ctl.survival_biasing && wgt < ctl.weight_cutoff) {
             gpu_russian_roulette(&wgt, ctl.weight_survive, &seeds[stream]);
           }

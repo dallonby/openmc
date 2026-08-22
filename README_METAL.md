@@ -161,16 +161,20 @@ ported and gated on the analog result:
 
 | Depth in a 0.6 m tungsten slab | survival biasing | weight windows |
 |---|---|---|
-| 30 cm | 1.3× | 0.4× |
-| 45 cm | 4.1× | 4.4× |
-| 55 cm | 1.8× | 7.6× |
-| 60 cm | 0.6× | **19.9×** |
+| 30 cm | 0.6× | 0.2× |
+| 45 cm | 1.7× | 1.6× |
+| 55 cm | 0.8× | **5.8×** |
+| 60 cm | 0.2× | **5.5×** |
 
 (Figure of merit `1/(relative error² × runtime)` relative to an analog run
-of the same model; weight windows here are a hand-tuned exponential
-`lower ∝ e^{-x/8cm}`, so a generated set should do better.) The gain grows
-with depth, which is the point: weight windows cost time in the shallow
-bins and buy it back where the statistics are thin.
+of the same model, hand-tuned exponential windows `lower ∝ e^{-x/8cm}`.
+Read these as single-realization estimates: the deepest bins have the
+fewest counts, so their FOM is itself noisy — an earlier single run of
+this same configuration gave 19.9× at 60 cm, which did not reproduce, and
+the repeatable figure is ~5–6×. Gains depend strongly on how well the
+windows are tuned; a generated (MAGIC/FW-CADIS) set should do better than
+this hand-fit.) The pattern that *is* robust: weight windows cost time in
+the shallow bins and buy it back at depth, which is the whole point.
 
 **Unbiasedness** is the property that matters more than the speedup, and
 it is tested rather than assumed: against a 40M-history analog reference,
@@ -181,9 +185,23 @@ same statistics shows the same spread against the reference. The test
 bounds any bias at roughly the ±0.5% level on the deep bins.
 
 Splitting uses the per-thread secondary stack first and spills to a global
-bank when it is full; the host re-dispatches the spill bank until it
-drains, so results are identical to transporting every secondary in the
-first pass. Dropped secondaries (bank full) are reported, not silent.
+bank when it is full; the host drains that bank in source-sized chunks,
+re-dispatching until it empties, with tallies and keff accumulating across
+passes. Spilled particles carry their parent's RNG state so they resume
+that stream rather than replaying a primary particle's sequence.
+
+**Saturation degrades gracefully rather than biasing.** When the banks are
+full the device makes *fewer* split copies and the parent keeps the weight
+the missing copies would have carried; an (n,xn) clone that cannot be
+placed falls back to implicit multiplication (the parent's weight is
+multiplied), which is the treatment OpenMC already uses for non-integer
+yields. Weight is conserved exactly in both cases, so the estimator stays
+unbiased and only the variance reduction weakens — the run warns that it
+delivered less splitting than requested. A stress case (`max_split` 40,
+e-folding 4 cm, banks saturating with ~35M requested copies per
+generation) returns a deep-half flux ratio of 1.0071 against the
+40M-history analog reference; before this treatment the same case came
+back 74% low.
 
 ## Architecture## Architecture
 

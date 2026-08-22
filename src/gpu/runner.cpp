@@ -389,6 +389,14 @@ void try_initialize()
   uint32_t max_filt = 1;
   for (const auto& t : eng.flat.tallies)
     max_filt = std::max(max_filt, t.n_filters);
+  // diagnostic override: force a larger per-thread nuclide array without
+  // changing the physics, to separate "thread-local footprint limits
+  // parallelism" from "per-nuclide work"
+  if (const char* e = std::getenv("OPENMC_GPU_FORCE_MAXNUC")) {
+    uint32_t v = (uint32_t)atoi(e);
+    if (v > max_nuc)
+      max_nuc = v;
+  }
   std::string preamble = fmt::format(
     "#define GPU_MAX_MAT_NUCLIDES {}\n#define GPU_MAX_COORD {}\n"
     "#define GPU_MAX_TALLY_FILTERS {}\n#define GPU_MAX_SECONDARY_STACK {}\n",

@@ -384,6 +384,64 @@ reduction, optional wavefront pipeline for collision-heavy CE, compiled
 metallib caching keyed on source hash, a host-side arena validator, and
 full-width RNG-state traces.
 
+## CE kernel cost investigation (2026-08-22)
+
+Measured cost split of the device kernel on the W-slab ablation model
+(10M histories, 60 depth cells): cross sections 37%, geometry 35%,
+tallies 14%, remaining floor 24%. Attacking the cross-section share
+produced one win and a long list of falsified hypotheses; both are
+recorded because the negatives are what bound the remaining headroom.
+
+**Kept.** The URR probability-table band search was a forward linear
+scan over ~20 bands, run twice per in-band nuclide lookup. Neighbouring
+histories draw unrelated variates, so every SIMD group waited on its
+unluckiest lane. Replacing it with a binary search over the (monotone)
+CDF returns the identical index in log2(n) uniform steps: **-3.7%**
+device time (3.752 s -> 3.615 s, five runs each, non-overlapping), with
+Godiva k-eff reproducing the recorded 1.00138(71) exactly.
+
+Bounding measurement: `settings.ptables = False` removes 16.7% of the
+kernel, so URR table work is real and the band search recovered about a
+fifth of it. The rest is the table walks themselves.
+
+**Falsified by measurement** (each reverted):
+
+1. Binary-search length in the main XS lookup — `log_grid_bins` 1e3 to
+   2e5 moved the kernel <1%.
+2. Cache lines per lookup — interleaving `[E, total, absorption]` into
+   one record: 3.744 s vs 3.740 s. Kept anyway for the 40% memory cut,
+   not for speed.
+3. 64-byte hot-record split of `GpuNuclide` — no gain, reverted.
+4. Thread-local footprint / occupancy — `micros[]` inflated 5 -> 64
+   slots costs 1.1%, and 1 -> 5 slots on the single-nuclide model is
+   free (2.288 s -> 2.188 s). `OPENMC_GPU_FORCE_MAXNUC` exists to
+   re-run this. The per-thread micro-XS array is not the limiter.
+5. Instruction-level parallelism — `#pragma unroll 4` on the nuclide
+   loop: no change.
+6. URR entry-gate gathers — hoisting the band bounds into `GpuNuclide`
+   so an out-of-band history rejects from registers rather than three
+   dependent gathers: no gain. The cost is in-band work, not rejection.
+7. Precomputing the URR skip-ahead coefficients on the host (they
+   depend only on the nuclide index): no gain, the compiler was already
+   hoisting the loop-invariant chain.
+
+`maxTotalThreadsPerThreadgroup` reports 1024 for this pipeline, which
+bounds the *register* allocation but says nothing about private stack
+residency — it should not be read as "not occupancy limited". What
+bounds it here is measurement: hypotheses 3-6 all target thread-local
+footprint and none of them moved the kernel.
+
+Remaining headroom is therefore structural, not incremental:
+compile-time feature specialization (URR, S(a,b), tallies, VR and
+run mode are still runtime branches in a kernel that is already
+runtime-compiled per model) and the event-based/wavefront pipeline. For
+uniform 20-40 event tungsten histories the SIMD length-imbalance
+ceiling is only about 1.31x, so wavefront transport is worth its
+complexity for long-tailed thermal problems rather than for this one.
+An order-of-magnitude gain on deep-penetration work comes from variance
+reduction, not from the kernel: weight windows already deliver 9.4x FOM
+at 55 cm.
+
 ## Deep-penetration acceptance (2026-08-21, fixed-source mode)
 
 The fixed-source envelope was accepted against the regime the reactor

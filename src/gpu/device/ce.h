@@ -128,6 +128,25 @@ DEVICE_FN float gpu_f1d(GpuCeView ce, int32_gpu blob, float x)
 
 //! Nuclide::calculate_xs equivalent (single temperature), including the
 //! S(a,b) blending of calculate_sab_xs when i_sab >= 0.
+//! First URR band with cdf[i] > r, clamped to n-1: the index a forward linear
+//! scan would stop on, found in log2(n) uniform steps instead. The tables are
+//! ~20 bands wide and neighbouring histories draw unrelated variates, so the
+//! scan made every SIMD group wait on its unluckiest lane. Worth 3.2% of the
+//! W-slab kernel; the CDF is monotone, so the index is unchanged.
+DEVICE_FN int32_gpu gpu_urr_band(GLOBAL const float* cdf, int32_gpu n, float r)
+{
+  int32_gpu lo = 0;
+  int32_gpu hi = n - 1;
+  while (lo < hi) {
+    int32_gpu mid = (lo + hi) >> 1;
+    if (cdf[mid] <= r)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
 DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
   int32_gpu i_log, int32_gpu i_sab, float sab_frac, GpuSabView sab,
   THREAD uint64_gpu* seeds)
@@ -229,12 +248,8 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
       float r = ((float)(w >> 40u) + 0.5f) * 0x1p-24f;
       // band search on both bracketing tables
       GLOBAL const float* cdf = ce.f32 + uh[6];
-      int32_gpu i_low = 0;
-      while (i_low < n_cdf - 1 && cdf[i_e * n_cdf + i_low] <= r)
-        ++i_low;
-      int32_gpu i_up = 0;
-      while (i_up < n_cdf - 1 && cdf[(i_e + 1) * n_cdf + i_up] <= r)
-        ++i_up;
+      int32_gpu i_low = gpu_urr_band(cdf + i_e * n_cdf, n_cdf, r);
+      int32_gpu i_up = gpu_urr_band(cdf + (i_e + 1) * n_cdf, n_cdf, r);
       GLOBAL const float* uxs = ce.f32 + uh[7]; // triplets (el, fis, ngam)
       float el, fis, cap;
       if (uh[2] == GPU_INTERP_LINLIN) {

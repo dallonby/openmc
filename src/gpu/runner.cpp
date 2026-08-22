@@ -556,6 +556,24 @@ void transport_generation()
       break;
     }
   ctl->n_tallies = tallies_active ? (uint32_t)eng.flat.tallies.size() : 0;
+  // do the active tallies score elastic / scatter at all?
+  ctl->need_elastic = 0u;
+  ctl->need_scatter = 0u;
+  if (ctl->n_tallies > 0) {
+    for (size_t ti = 0; ti < eng.flat.tallies.size(); ++ti) {
+      const GpuTallyDesc& td = eng.flat.tallies[ti];
+      int32_t host_idx = eng.flat.tally_host_index[ti];
+      if (!model::tallies[host_idx]->active_)
+        continue;
+      for (uint32_t k = 0; k < td.n_scores; ++k) {
+        int32_t code = eng.flat.i32[td.score_off + k];
+        if (code == GPU_SCORE_ELASTIC)
+          ctl->need_elastic = 1u;
+        if (code == GPU_SCORE_SCATTER)
+          ctl->need_scatter = 1u;
+      }
+    }
+  }
 
   // ---- source upload (fp64 -> fp32) ----
   auto* src =

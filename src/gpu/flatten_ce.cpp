@@ -564,23 +564,29 @@ bool flatten_ce(FlatModel& m)
     const auto& grid = nuc.grid_[i_temp];
     size_t ng = grid.energy.size();
     gn.n_grid = (uint32_t)ng;
-    gn.grid_off = fx.push_fc(grid.energy);
 
     // log hash table
     gn.loggrid_off = fx.i32_off();
     for (int v : grid.grid_index)
       m.i32.push_back(v);
 
-    // xs table [n][4]: total, absorption, fission, nu_fission
-    // column indices fixed upstream (nuclide.cpp:45): 0 total,
-    // 1 absorption, 2 fission, 3 nu-fission, 4 photon production
+    // Interleave energy with the cross sections so one cache line serves
+    // both (see GpuNuclide): [E, total, absorption] and, only for
+    // fissionable nuclides, [+ fission, nu_fission]. Upstream column
+    // indices (nuclide.cpp:45): 0 total, 1 absorption, 2 fission,
+    // 3 nu-fission.
     const auto& xs = nuc.xs_[i_temp];
-    gn.xs_off = fx.f32_off();
+    const bool fiss = nuc.fissionable_;
+    gn.xs_stride = fiss ? 5u : 3u;
+    gn.grid_off = fx.f32_off();
     for (size_t i = 0; i < ng; ++i) {
+      m.f32.push_back((float)grid.energy[i]);
       m.f32.push_back((float)xs(i, 0));
       m.f32.push_back((float)xs(i, 1));
-      m.f32.push_back((float)xs(i, 2));
-      m.f32.push_back((float)xs(i, 3));
+      if (fiss) {
+        m.f32.push_back((float)xs(i, 2));
+        m.f32.push_back((float)xs(i, 3));
+      }
     }
 
     // elastic xs (reactions_[0], threshold 0)

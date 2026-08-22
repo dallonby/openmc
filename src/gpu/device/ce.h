@@ -27,10 +27,17 @@ void gpu_host_debug_angle(int32_gpu i, float r1, int32_gpu k, float ck,
 struct GpuNuclide {
   float awr;
   float kT;            // selected temperature (eV)
-  uint32_gpu grid_off; // f32: energy grid, ascending
+  // f32: interleaved per-grid-point records, ascending in energy:
+  //   [E, total, absorption]              (xs_stride = 3, non-fissionable)
+  //   [E, total, absorption, fis, nu_fis] (xs_stride = 5, fissionable)
+  // Energy and cross sections share a cache line because the lookup is
+  // bound by random cache-line fetches, not by the search: a log-grid-bins
+  // sweep from 1e3 to 2e5 moved the W-slab kernel by <1%, while separate
+  // grid/xs arrays cost 2-3 lines per nuclide per collision.
+  uint32_gpu grid_off;
   uint32_gpu n_grid;
+  uint32_gpu xs_stride;
   uint32_gpu loggrid_off; // i32: n_log_bins+1 hash -> grid index
-  uint32_gpu xs_off;      // f32: n_grid * 4 (total, abs, fis, nu_fis)
   uint32_gpu elastic_off; // f32: n_grid elastic xs
   uint32_gpu fissionable;
   int32_gpu total_nu_f1d;  // i32 fn blob or -1
@@ -133,12 +140,13 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
   m.i_sab = -1;
   m.use_ptable = 0;
 
-  GLOBAL const float* grid = ce.f32 + nuc.grid_off;
+  GLOBAL const float* rec = ce.f32 + nuc.grid_off;
+  int32_gpu st = (int32_gpu)nuc.xs_stride;
   int32_gpu ng = (int32_gpu)nuc.n_grid;
   int32_gpu i_grid;
-  if (E <= grid[0]) {
+  if (E <= rec[0]) {
     i_grid = 0;
-  } else if (E >= grid[ng - 1]) {
+  } else if (E >= rec[st * (ng - 1)]) {
     i_grid = ng - 2;
   } else {
     GLOBAL const int32_gpu* lg = ce.i32 + nuc.loggrid_off;
@@ -149,7 +157,7 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
     // binary search in [lo, hi] for largest i with grid[i] <= E
     while (hi - lo > 1) {
       int32_gpu mid = (lo + hi) / 2;
-      if (E >= grid[mid])
+      if (E >= rec[st * mid])
         lo = mid;
       else
         hi = mid;
@@ -159,19 +167,20 @@ DEVICE_FN GpuMicroXS gpu_ce_micro_xs(GpuCeView ce, GpuNuclide nuc, float E,
   // fp32 casts can collapse a RUN of adjacent fp64 knots to one value:
   // walk to the end of the run (never past ng-2, so no OOB read), and use
   // f = 0 if the grid ends inside a collapsed run (row i_grid, no interp)
-  while (i_grid + 2 < ng && grid[i_grid] == grid[i_grid + 1])
+  while (i_grid + 2 < ng && rec[st * i_grid] == rec[st * (i_grid + 1)])
     ++i_grid;
-  float dgrid = grid[i_grid + 1] - grid[i_grid];
-  float f = (dgrid > 0.0f) ? (E - grid[i_grid]) / dgrid : 0.0f;
+  GLOBAL const float* r0 = rec + st * i_grid; // this point and the next share
+  GLOBAL const float* r1 = r0 + st;           // a cache line for stride 3
+  float dgrid = r1[0] - r0[0];
+  float f = (dgrid > 0.0f) ? (E - r0[0]) / dgrid : 0.0f;
   m.i_grid = i_grid;
   m.interp = f;
 
-  GLOBAL const float* xs = ce.f32 + nuc.xs_off;
-  m.total = (1.0f - f) * xs[4 * i_grid] + f * xs[4 * i_grid + 4];
-  m.absorption = (1.0f - f) * xs[4 * i_grid + 1] + f * xs[4 * i_grid + 5];
+  m.total = (1.0f - f) * r0[1] + f * r1[1];
+  m.absorption = (1.0f - f) * r0[2] + f * r1[2];
   if (nuc.fissionable) {
-    m.fission = (1.0f - f) * xs[4 * i_grid + 2] + f * xs[4 * i_grid + 6];
-    m.nu_fission = (1.0f - f) * xs[4 * i_grid + 3] + f * xs[4 * i_grid + 7];
+    m.fission = (1.0f - f) * r0[3] + f * r1[3];
+    m.nu_fission = (1.0f - f) * r0[4] + f * r1[4];
   } else {
     m.fission = 0.0f;
     m.nu_fission = 0.0f;

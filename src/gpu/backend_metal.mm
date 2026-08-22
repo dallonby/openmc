@@ -11,6 +11,8 @@
 
 #include "backend.h"
 
+#include <cstdlib>
+
 namespace {
 
 struct MetalCtx {
@@ -161,8 +163,35 @@ int omg_metal_dispatch(
         [enc setBuffer:ctx->buffers[i] offset:0 atIndex:(NSUInteger)i];
     }
     NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-    if (tg > 256)
-      tg = 256;
+    // OPENMC_GPU_TG overrides the threadgroup size (occupancy experiments)
+    static NSUInteger tg_override = 0;
+    static bool tg_read = false;
+    if (!tg_read) {
+      tg_read = true;
+      if (const char* e = std::getenv("OPENMC_GPU_TG"))
+        tg_override = (NSUInteger)atoi(e);
+    }
+    // Full 1024-wide threadgroups measured fastest on the memory-bound CE
+    // kernel (W slab 1.73 -> 1.85 M hist/s); the pipeline reports
+    // maxTotalThreadsPerThreadgroup = 1024, so the kernel is not register
+    // limited. OPENMC_GPU_TG overrides for experiments.
+    if (tg > 1024)
+      tg = 1024;
+    if (tg_override > 0 && tg_override <= pso.maxTotalThreadsPerThreadgroup)
+      tg = tg_override;
+    if (std::getenv("OPENMC_GPU_OCCUPANCY")) {
+      static bool once = false;
+      if (!once) {
+        once = true;
+        std::fprintf(stderr,
+          "[gpu-occupancy] kernel=%s maxThreadsPerThreadgroup=%lu "
+          "threadExecutionWidth=%lu staticThreadgroupMemory=%lu bytes "
+          "-> dispatching tg=%lu\n",
+          fn, (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+          (unsigned long)pso.threadExecutionWidth,
+          (unsigned long)pso.staticThreadgroupMemoryLength, (unsigned long)tg);
+      }
+    }
     [enc dispatchThreads:MTLSizeMake(nthreads, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
@@ -210,8 +239,35 @@ int omg_metal_dispatch_async(
         [enc setBuffer:ctx->buffers[i] offset:0 atIndex:(NSUInteger)i];
     }
     NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-    if (tg > 256)
-      tg = 256;
+    // OPENMC_GPU_TG overrides the threadgroup size (occupancy experiments)
+    static NSUInteger tg_override = 0;
+    static bool tg_read = false;
+    if (!tg_read) {
+      tg_read = true;
+      if (const char* e = std::getenv("OPENMC_GPU_TG"))
+        tg_override = (NSUInteger)atoi(e);
+    }
+    // Full 1024-wide threadgroups measured fastest on the memory-bound CE
+    // kernel (W slab 1.73 -> 1.85 M hist/s); the pipeline reports
+    // maxTotalThreadsPerThreadgroup = 1024, so the kernel is not register
+    // limited. OPENMC_GPU_TG overrides for experiments.
+    if (tg > 1024)
+      tg = 1024;
+    if (tg_override > 0 && tg_override <= pso.maxTotalThreadsPerThreadgroup)
+      tg = tg_override;
+    if (std::getenv("OPENMC_GPU_OCCUPANCY")) {
+      static bool once = false;
+      if (!once) {
+        once = true;
+        std::fprintf(stderr,
+          "[gpu-occupancy] kernel=%s maxThreadsPerThreadgroup=%lu "
+          "threadExecutionWidth=%lu staticThreadgroupMemory=%lu bytes "
+          "-> dispatching tg=%lu\n",
+          fn, (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+          (unsigned long)pso.threadExecutionWidth,
+          (unsigned long)pso.staticThreadgroupMemoryLength, (unsigned long)tg);
+      }
+    }
     [enc dispatchThreads:MTLSizeMake(nthreads, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];

@@ -308,6 +308,12 @@ struct GpuControl {
   uint32_gpu source_is_spill;     // source sites carry their own particle id
   uint32_gpu spill_uid_lo;        // base of the disjoint spill id space
   uint32_gpu spill_uid_hi;
+  // Which macroscopic quantities the active tallies actually score. The
+  // elastic term costs a per-nuclide loop on EVERY flight, so it is only
+  // computed when some tally asks for it (flux-only shielding tallies do
+  // not).
+  uint32_gpu need_elastic;
+  uint32_gpu need_scatter;
   // i32 arena: per-surface adjacency index (n_surfaces offsets, each to a
   // [count, cell...] list of the cells whose region references the surface)
   uint32_gpu surf_adj_off;

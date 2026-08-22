@@ -1038,12 +1038,18 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       if (tv.n_tallies > 0) {
         if (gs.material != GPU_MATERIAL_VOID) {
           if (is_ce) {
-            mac_scat = xs.total - xs.absorption;
-            for (uint32_gpu i = 0; i < mat.n_nuclides; ++i) {
-              int32_gpu in = geom.i32[mat.nuclide_off + i];
-              GpuNuclide nuc = ce.nuclides[in];
-              float dens = geom.f32[mat.density_off + i] * gs.density_mult;
-              mac_elastic += dens * gpu_ce_elastic_xs(ce, nuc, &micros[i]);
+            if (ctl.need_scatter)
+              mac_scat = xs.total - xs.absorption;
+            // the elastic macro XS needs a per-nuclide pass over the whole
+            // material on every flight; skip it entirely unless a tally
+            // actually scores elastic
+            if (ctl.need_elastic) {
+              for (uint32_gpu i = 0; i < mat.n_nuclides; ++i) {
+                int32_gpu in = geom.i32[mat.nuclide_off + i];
+                GpuNuclide nuc = ce.nuclides[in];
+                float dens = geom.f32[mat.density_off + i] * gs.density_mult;
+                mac_elastic += dens * gpu_ce_elastic_xs(ce, nuc, &micros[i]);
+              }
             }
           } else {
             GpuMgMat m = mg.mats[gs.material];

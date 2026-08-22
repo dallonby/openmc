@@ -1167,35 +1167,7 @@ void transport_generation()
     }
   }
 
-  // ---- dispatch (async) + overlapped prefetch of the next source ----
   char err[1024];
-  if (omg_metal_dispatch_async(
-        eng.ctx, "openmc_transport", (unsigned)n, err, sizeof(err))) {
-    fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
-  }
-  const bool last_generation =
-    simulation::current_batch >= settings::n_batches &&
-    simulation::current_gen >= settings::gen_per_batch;
-  if (prefetch_ok && !last_generation) {
-    prefetched.resize((size_t)n);
-    double w = 0.0;
-#pragma omp parallel for reduction(+ : w)
-    for (int64_t i = 0; i < n; ++i) {
-      int64_t id = compute_transport_seed(compute_particle_id(i + 1)) +
-                   settings::n_particles;
-      uint64_t seed = init_seed(id, STREAM_SOURCE);
-      SourceSite s = sample_external_source(&seed);
-      fill_site(prefetched[i], s);
-      w += s.wgt;
-    }
-    prefetched_weight = w;
-    have_prefetch = true;
-  }
-  if (omg_metal_wait(eng.ctx, err, sizeof(err))) {
-    fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
-  }
-  eng.gpu_seconds += omg_metal_last_time(eng.ctx);
-
   // Deterministic fp64 reduction of the per-particle keff slots: fixed chunk
   // partition, each chunk summed in index order, chunks combined in index
   // order — identical for any thread count and run to run. Runs once per
@@ -1226,7 +1198,104 @@ void transport_generation()
     global_tally_absorption += sums[GPU_RED_K_ABSORPTION];
     global_tally_leakage += sums[GPU_RED_LEAKAGE];
   };
-  reduce_keff((int64_t)ctl->n_particles);
+
+  // ---- dispatch in chunks, with interactivity-watchdog recovery ----
+  // macOS aborts a compute command buffer that runs long enough to hurt
+  // desktop responsiveness (kIOGPUCommandBufferCallbackErrorImpacting-
+  // Interactivity). A whole batch in one buffer is seconds of GPU work, so
+  // anything else the user does could kill a run that is hours old. Submit
+  // the batch in chunks short enough to stay under the watchdog, and if one
+  // is killed anyway, rewind and replay it smaller.
+  static uint32_t s_chunk = 0;
+  if (s_chunk == 0) {
+    s_chunk = 1u << 20;
+    if (const char* e = std::getenv("OPENMC_GPU_CHUNK"))
+      s_chunk = (uint32_t)std::max(4096, atoi(e));
+  }
+  const bool last_generation =
+    simulation::current_batch >= settings::n_batches &&
+    simulation::current_gen >= settings::gen_per_batch;
+  auto do_prefetch = [&]() {
+    if (!prefetch_ok || last_generation)
+      return;
+    prefetched.resize((size_t)n);
+    double w = 0.0;
+#pragma omp parallel for reduction(+ : w)
+    for (int64_t i = 0; i < n; ++i) {
+      int64_t id = compute_transport_seed(compute_particle_id(i + 1)) +
+                   settings::n_particles;
+      uint64_t seed = init_seed(id, STREAM_SOURCE);
+      SourceSite s = sample_external_source(&seed);
+      fill_site(prefetched[i], s);
+      w += s.wgt;
+    }
+    prefetched_weight = w;
+    have_prefetch = true;
+  };
+
+  // State that accumulates across chunks. A killed command buffer may still
+  // have let some threads finish, so their tally scores and bank appends are
+  // already in memory; replaying without rewinding would double-count them.
+  // The fission and spill banks are addressed by their counters, so rewinding
+  // the counters logically rewinds the banks too.
+  const size_t taccum_bytes =
+    (size_t)eng.flat.tally_accum_size * eng.tally_replicas * 4;
+  std::vector<uint8_t> taccum_save(taccum_bytes);
+  uint32_t ctr_save[GPU_CTR_COUNT];
+  auto snapshot_accum = [&]() {
+    if (taccum_bytes)
+      std::memcpy(taccum_save.data(),
+        omg_metal_contents(eng.ctx, OMG_SLOT_TACCUM), taccum_bytes);
+    std::memcpy(ctr_save, omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS),
+      sizeof(ctr_save));
+  };
+  auto rewind_accum = [&]() {
+    if (taccum_bytes)
+      std::memcpy(omg_metal_contents(eng.ctx, OMG_SLOT_TACCUM),
+        taccum_save.data(), taccum_bytes);
+    std::memcpy(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS), ctr_save,
+      sizeof(ctr_save));
+  };
+
+  // Runs one chunk; returns how many particles it actually consumed, which
+  // is smaller than requested if the watchdog forced a reduction.
+  auto run_chunk = [&](uint32_t offset, uint32_t count, bool prefetch) {
+    for (;;) {
+      ctl->n_particles = count;
+      ctl->source_offset = offset;
+      std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS), 0,
+        (size_t)count * GPU_RED_WIDTH * 4);
+      snapshot_accum();
+      bool bad = omg_metal_dispatch_async(
+        eng.ctx, "openmc_transport", count, err, sizeof(err));
+      if (!bad) {
+        if (prefetch)
+          do_prefetch();
+        bad = omg_metal_wait(eng.ctx, err, sizeof(err));
+      }
+      if (!bad) {
+        eng.gpu_seconds += omg_metal_last_time(eng.ctx);
+        reduce_keff((int64_t)count);
+        return count;
+      }
+      if (std::strstr(err, "Interactivity") == nullptr || count <= 4096)
+        fatal_error(fmt::format("GPU transport dispatch failed: {}", err));
+      rewind_accum();
+      count /= 2;
+      s_chunk = count;
+      warning(fmt::format("GPU dispatch interrupted by the system for "
+                          "impacting interactivity; retrying with {} "
+                          "particles per dispatch",
+        count));
+    }
+  };
+
+  for (uint32_t off = 0, first = 1; off < (uint32_t)n; first = 0)
+    off += run_chunk(off, std::min<uint32_t>(s_chunk, (uint32_t)n - off),
+      first != 0);
+  ctl->n_particles = (uint32_t)n;
+  ctl->source_offset = 0;
+
 
   // ---- spill drain: weight-window splits and (n,xn) clones that did not
   // fit in a thread's local stack were banked globally; re-dispatch them
@@ -1247,7 +1316,7 @@ void transport_generation()
       // appends new spills from the retained count upward, so nothing is
       // overwritten.
       const uint32_t src_cap = (uint32_t)n;
-      uint32_t take = std::min(spill, src_cap);
+      uint32_t take = std::min(std::min(spill, src_cap), s_chunk);
       auto* spill_bank = static_cast<GpuSourceSite*>(
         omg_metal_contents(eng.ctx, OMG_SLOT_FISSION));
       auto* src_buf = static_cast<GpuSourceSite*>(

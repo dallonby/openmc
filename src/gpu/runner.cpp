@@ -397,10 +397,15 @@ void try_initialize()
     if (v > max_nuc)
       max_nuc = v;
   }
+  // diagnostic: shrink the per-thread secondary stack to test whether live
+  // private state, not instruction count, bounds this kernel
+  uint32_t sec_stack = settings::run_CE ? 8 : 1;
+  if (const char* e = std::getenv("OPENMC_GPU_SEC_STACK"))
+    sec_stack = (uint32_t)std::max(1, atoi(e));
   std::string preamble = fmt::format(
     "#define GPU_MAX_MAT_NUCLIDES {}\n#define GPU_MAX_COORD {}\n"
     "#define GPU_MAX_TALLY_FILTERS {}\n#define GPU_MAX_SECONDARY_STACK {}\n",
-    max_nuc, model::n_coord_levels + 1, max_filt, settings::run_CE ? 8 : 1);
+    max_nuc, model::n_coord_levels + 1, max_filt, sec_stack);
   std::string src = preamble +
     std::string(reinterpret_cast<const char*>(openmc_gpu_msl),
       (size_t)openmc_gpu_msl_len);

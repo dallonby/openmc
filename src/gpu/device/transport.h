@@ -821,6 +821,16 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   }
   int stream = GPU_STREAM_TRACKING;
 
+#if GPU_DIAG_BALLAST > 0
+  // diagnostic: adds a known quantity of live private state, held across the
+  // whole event loop, to locate this kernel on the occupancy-vs-private-state
+  // curve. A synthetic Metal benchmark shows gather throughput falling 3.3x
+  // between ~128 B and 2 KB of live array; this says where we already sit.
+  float ballast[GPU_DIAG_BALLAST];
+  for (int i = 0; i < GPU_DIAG_BALLAST; ++i)
+    ballast[i] = (float)(tid + (uint32_gpu)i);
+#endif
+
   GpuGeomState gs;
   gs.n_coord = 1;
   gs.surface = GPU_SURFACE_NONE;
@@ -1697,6 +1707,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       }
 
       ++n_events;
+#if GPU_DIAG_BALLAST > 0
+      ballast[n_events % GPU_DIAG_BALLAST] += E;
+#endif
       if (n_events >= ctl.max_events) {
         gpu_atomic_add_u32(banks.counters + GPU_CTR_MAX_EVENT_HIT, 1u);
         wgt = 0.0f;
@@ -1736,6 +1749,16 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   // bit-identical for 82 batches before splitting. Per-particle slots make
   // the reduction deterministic (and remove 4 atomics per history).
   uint32_gpu slot = tid * GPU_RED_WIDTH;
+#if GPU_DIAG_BALLAST > 0
+  {
+    float bsum = 0.0f;
+    for (int i = 0; i < GPU_DIAG_BALLAST; ++i)
+      bsum += ballast[i];
+    // never true, but the compiler cannot prove it: keeps the array live
+    if (bsum == -1.0e30f)
+      gpu_atomic_add_u32(banks.counters + GPU_CTR_TRACE, 1u);
+  }
+#endif
   banks.red_slots[slot + GPU_RED_K_TRACKLENGTH] = k_tl;
   banks.red_slots[slot + GPU_RED_K_COLLISION] = k_col;
   banks.red_slots[slot + GPU_RED_K_ABSORPTION] = k_abs;

@@ -402,10 +402,14 @@ void try_initialize()
   uint32_t sec_stack = settings::run_CE ? 8 : 1;
   if (const char* e = std::getenv("OPENMC_GPU_SEC_STACK"))
     sec_stack = (uint32_t)std::max(1, atoi(e));
+  int ballast = 0;
+  if (const char* e = std::getenv("OPENMC_GPU_BALLAST"))
+    ballast = std::max(0, atoi(e));
   std::string preamble = fmt::format(
     "#define GPU_MAX_MAT_NUCLIDES {}\n#define GPU_MAX_COORD {}\n"
-    "#define GPU_MAX_TALLY_FILTERS {}\n#define GPU_MAX_SECONDARY_STACK {}\n",
-    max_nuc, model::n_coord_levels + 1, max_filt, sec_stack);
+    "#define GPU_MAX_TALLY_FILTERS {}\n#define GPU_MAX_SECONDARY_STACK {}\n"
+    "#define GPU_DIAG_BALLAST {}\n",
+    max_nuc, model::n_coord_levels + 1, max_filt, sec_stack, ballast);
   std::string src = preamble +
     std::string(reinterpret_cast<const char*>(openmc_gpu_msl),
       (size_t)openmc_gpu_msl_len);

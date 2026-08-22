@@ -72,19 +72,27 @@ DEVICE_FN int32_gpu gpu_mesh_index_dir(
 DEVICE_FN int32_gpu gpu_grid_index(
   GLOBAL const float* g, int32_gpu npts, float v)
 {
+  // CPU: lower_bound_index(begin,end,v)+1, i.e.
+  //   v == g[0]            -> bin 1
+  //   g[k-1] < v <= g[k]   -> bin k      (exact interior edge = LOWER bin)
+  //   v == g[npts-1]       -> bin npts-1 (last valid bin, not outside)
   if (v < g[0])
     return 0;
-  if (v >= g[npts - 1])
-    return npts; // shape+1 (npts-1 cells) unless v==back handled by caller
+  if (v == g[0])
+    return 1;
+  if (v > g[npts - 1])
+    return npts;
+  // first index with g[idx] >= v  (std::lower_bound)
   int32_gpu lo = 0, hi = npts - 1;
   while (hi - lo > 1) {
     int32_gpu mid = (lo + hi) / 2;
-    if (v >= g[mid])
-      lo = mid;
-    else
+    if (g[mid] >= v)
       hi = mid;
+    else
+      lo = mid;
   }
-  return lo + 1;
+  int32_gpu idx = (g[lo] >= v) ? lo : hi;
+  return idx; // (idx - 1) + 1
 }
 
 //! cylindrical (r,phi,z) indices in the mesh-local frame
@@ -103,10 +111,15 @@ DEVICE_FN bool gpu_mesh_indices_cyl(
     if (phi < 0.0f)
       phi += 6.283185307179586f;
     ijk[1] = gpu_grid_index(f32 + m.phigrid_off, m.ny + 1, phi);
-    if (ijk[1] < 1)
-      ijk[1] = m.ny; // sanitize wrap
-    if (ijk[1] > m.ny)
-      ijk[1] = 1;
+    if (m.full_phi) {
+      // only a full 2*pi grid wraps (CPU sanitize_phi)
+      if (ijk[1] < 1)
+        ijk[1] = m.ny;
+      if (ijk[1] > m.ny)
+        ijk[1] = 1;
+    } else if (ijk[1] < 1 || ijk[1] > m.ny) {
+      in = false; // a wedge mesh genuinely ends here
+    }
   }
   ijk[2] = gpu_grid_index(f32 + m.zgrid_off, m.nz + 1, lz);
   if (ijk[2] < 1 || ijk[2] > m.nz)
@@ -214,11 +227,11 @@ DEVICE_FN float gpu_mesh_dist_cyl(GpuMesh m, GLOBAL const float* f32,
     float d_dn = gpu_cyl_phi_cross(m, f32, lr, u, l, ijk[1] - 1);
     if (d_dn < d_up) {
       int32_gpu nx = ijk[1] - 1;
-      *next = (nx < 1) ? m.ny : nx;
+      *next = (nx < 1 && m.full_phi) ? m.ny : nx;
       return d_dn;
     }
     int32_gpu nx = ijk[1] + 1;
-    *next = (nx > m.ny) ? 1 : nx;
+    *next = (nx > m.ny && m.full_phi) ? 1 : nx;
     return d_up;
   } else {
     *next = ijk[2];
@@ -694,12 +707,16 @@ DEVICE_FN bool gpu_push_secondary(GCONST GpuControl& ctl, GpuBanks banks,
   site.n_split = vr->n_split;
   // carry the parent's stream so the child continues it rather than
   // replaying some primary particle's sequence
-  uint64_gpu st = seeds[GPU_STREAM_TRACKING];
-  uint64_gpu su = seeds[GPU_STREAM_URR_PTABLE];
-  site.seed_track_lo = (uint32_gpu)(st & 0xffffffffu);
-  site.seed_track_hi = (uint32_gpu)(st >> 32);
-  site.seed_urr_lo = (uint32_gpu)(su & 0xffffffffu);
-  site.seed_urr_hi = (uint32_gpu)(su >> 32);
+  // unique id from a monotonic counter, in an id space disjoint from the
+  // primaries', so siblings get independent streams (copying the parent's
+  // state would make them identical particles)
+  uint64_gpu serial =
+    (uint64_gpu)gpu_atomic_add_u32(banks.counters + GPU_CTR_SPILL_SERIAL, 1u);
+  uint64_gpu base = ((uint64_gpu)ctl.spill_uid_hi << 32) |
+                    (uint64_gpu)ctl.spill_uid_lo;
+  uint64_gpu uid = base + serial + 1;
+  site.uid_lo = (uint32_gpu)(uid & 0xffffffffu);
+  site.uid_hi = (uint32_gpu)(uid >> 32);
   banks.fission[idx] = site;
   return true;
 }
@@ -794,13 +811,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 
   uint64_gpu seeds[GPU_N_STREAMS];
   if (ctl.source_is_spill) {
-    // a spilled secondary resumes its parent's stream (see GpuSourceSite)
-    for (int i = 0; i < GPU_N_STREAMS; ++i)
-      seeds[i] = 0;
-    seeds[GPU_STREAM_TRACKING] = ((uint64_gpu)src.seed_track_hi << 32) |
-                                 (uint64_gpu)src.seed_track_lo;
-    seeds[GPU_STREAM_URR_PTABLE] =
-      ((uint64_gpu)src.seed_urr_hi << 32) | (uint64_gpu)src.seed_urr_lo;
+    // spilled secondary: seed from its own unique id (see GpuSourceSite)
+    gpu_init_particle_seeds(
+      (int64_gpu)(((uint64_gpu)src.uid_hi << 32) | (uint64_gpu)src.uid_lo),
+      ctl.master_seed, ctl.prn_stride, seeds);
   } else {
     gpu_init_particle_seeds((int64_gpu)ctl.seed_base + index_source,
       ctl.master_seed, ctl.prn_stride, seeds);
@@ -862,6 +876,13 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   int32_gpu xs_key_mat = -2;
   float xs_key_E = -1.0f;
   float xs_key_dm = 0.0f;
+
+  // birth weight-window checkpoint (CPU applies apply_weight_windows in
+  // initialize_particle_track, which is what fixes wgt_ww_born for the whole
+  // history; doing it later normalizes against the wrong window)
+  if (ctl.ww_on && wgt > 0.0f)
+    gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
+      gs.coord[0].r, gs.coord[0].u, E, time, &wgt, seeds);
 
   bool found =
     gpu_exhaustive_find_cell(geom, &gs, ctl.root_universe, ctl.n_coord_levels);
@@ -1094,6 +1115,13 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             }
             float un = gpu_norm(u_new);
             u_new = gpu_scale(u_new, 1.0f / un);
+            // CPU applies the surface checkpoint after reflection too
+            if (ctl.ww_on && ctl.ww_checkpoint_surface && wgt > 0.0f) {
+              gpu_apply_weight_window(ctl, tv, banks, sec_stack, &n_stack, &vr,
+                gs.coord[0].r, u_new, E, time, &wgt, seeds);
+              if (wgt <= 0.0f)
+                break;
+            }
             // CPU cross_reflective_bc PINS the root cell (coord(0).cell =
             // cell_last(0)) and re-finds only the lower universes: the
             // reflected particle is still in the same root-level cell, and
@@ -1492,6 +1520,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
                       sc->wgt = wgt;
                       sc->time = time;
                     } else {
+                      // eigenvalue mode has no spill bank: conserve the
+                      // neutron's weight by implicit multiplication rather
+                      // than dropping it
+                      ++missed;
                       gpu_atomic_add_u32(
                         banks.counters + GPU_CTR_SECONDARY_BANK, 1u);
                     }
@@ -1512,9 +1544,6 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
             gpu_advance_prn_seed(
               (int64_gpu)ce.n_nuclides, &seeds[GPU_STREAM_URR_PTABLE]);
           }
-          // energy cutoff (physics.cpp:112): kill, not clamp
-          if (wgt > 0.0f && E < ctl.energy_cutoff)
-            wgt = 0.0f;
         } else {
           // ---- multigroup collision (physics_mg.cpp) ----
           GpuMgMat m = mg.mats[gs.material];
@@ -1568,7 +1597,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
               absorbed = true;
             }
           }
-          if (!absorbed) {
+          if (!absorbed && wgt > 0.0f) {
             float mu;
             int32_gpu gout =
               gpu_mg_sample_scatter(mg, m, g, &mu, &wgt, &seeds[stream]);
@@ -1601,6 +1630,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           } else if (ctl.survival_biasing && wgt < ctl.weight_cutoff) {
             gpu_russian_roulette(&wgt, ctl.weight_survive, &seeds[stream]);
           }
+          // energy cutoff (physics.cpp:112) comes AFTER the window, as on CPU
+          if (is_ce && wgt > 0.0f && E < ctl.energy_cutoff)
+            wgt = 0.0f;
         }
 
         // reconcile_cell_after_collision (geometry.cpp), run on EVERY

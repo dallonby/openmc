@@ -429,6 +429,59 @@ profiles include the secondary-gamma population — +20% at the face and
 up to +40% deep. The clean neutron-only profiles from this acceptance
 run supersede them for neutron-flux ratio work.
 
+## 2026-08-21 adversarial review (Codex) of the mesh/VR/optimization wave
+
+A targeted adversarial review — "try to falsify these five claims" — over
+the five commits from `10bf3e5b1` to `db3be331b`. It returned 13 findings;
+every one was verified against both the device code and the CPU original
+before acting. Fixed:
+
+* **Split siblings were identical particles.** My own earlier fix carried
+  the *parent's* RNG state onto every spilled child, so all siblings (and
+  the parent) replayed one stream from the same position, energy and
+  weight — the split multiplied weight without adding any independent
+  sampling. Each spilled secondary now takes a unique particle id from a
+  monotonic counter in an id space disjoint from the primaries', and seeds
+  its streams from that.
+* **Birth weight-window checkpoint was missing** (CPU applies it in
+  `initialize_particle_track`), so `wgt_ww_born` was fixed by the first
+  *later* checkpoint and every window was normalized against the wrong
+  reference.
+* **Checkpoint ordering**: the surface checkpoint now also runs after
+  reflective/white reflection, and the CE energy cutoff now runs *after*
+  the collision window, both matching CPU.
+* **Partial-φ cylindrical meshes wrapped outside points back inside**;
+  only a full 2π grid wraps now (CPU `sanitize_phi`).
+* **Cylindrical grid edge ownership** now reproduces
+  `lower_bound_index()+1` exactly, including the exact-interior-edge (lower
+  bin) and exact-outer-edge (last valid bin, not "outside") cases.
+* **MG pure absorbers crashed under survival biasing**: implicit capture
+  drove the weight to zero but the scatter row was still sampled; gated on
+  `wgt > 0` as CPU gates on `alive()`.
+* **An (n,xn) clone that cannot be banked** now falls back to implicit
+  multiplication in eigenvalue mode too, instead of aborting the run.
+* **Spill exhaustion after the pass limit is fatal**, not a warning —
+  those banked sites carry real weight.
+* **Two mesh filters on one tally** used an uninitialized bin; rejected at
+  flatten.
+* **Prefetch is disabled when the shared secondary bank is active** (weight
+  windows enable it by default, which changes `compute_particle_id`), and
+  its state is cleared on `finalize()` so a second in-process simulation
+  cannot inherit the previous model's source sites.
+* **Thread accumulators** are resized from the serial flush, so
+  re-initializing the library with more threads cannot index past the end.
+* Replica collapse for very large tally meshes now warns.
+
+Not fixed, documented instead: the mesh-crossing tolerances are the fp32
+values (`GPU_TINY_BIT` 1e-5, radial 1e-6) rather than CPU's 1e-8/1e-10, so
+sub-micron tracks and grazing shell contacts are treated differently; and
+the replicated-bank scheme still degrades toward one bank for meshes
+beyond ~8M bins.
+
+Codex reported it could **not** falsify the deterministic keff reduction,
+the XS cache, surface adjacency, async buffer ownership, or the CPU flush
+ordering.
+
 ## Debug tooling (env-gated, zero cost when unset)
 
 | Variable | Effect |

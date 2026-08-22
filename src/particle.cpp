@@ -587,8 +587,18 @@ struct alignas(64) ThreadAccumulator {
 };
 std::vector<ThreadAccumulator>& thread_accumulators()
 {
+  // Sized on first use, but openmc.lib can re-initialize the library in the
+  // same process with a different thread count; grow serially (from the
+  // flush, never from a worker) so no thread indexes past the end.
   static std::vector<ThreadAccumulator> acc(num_threads());
   return acc;
+}
+
+void resize_thread_accumulators()
+{
+  auto& acc = thread_accumulators();
+  if ((int)acc.size() < num_threads())
+    acc.resize(num_threads());
 }
 ThreadAccumulator& thread_accumulator()
 {
@@ -603,6 +613,7 @@ void thread_accumulate_source_weight(double w)
 
 void flush_thread_accumulators()
 {
+  resize_thread_accumulators();
   for (auto& a : thread_accumulators()) {
     global_tally_absorption += a.absorption;
     global_tally_collision += a.collision;

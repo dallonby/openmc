@@ -342,7 +342,8 @@ int openmc_next_batch(int* status)
     }
 
     // Fold the per-thread accumulators into the shared globals (once per
-    // generation, serially — see flush_thread_accumulators)
+    // generation, serially — see flush_thread_accumulators). Also the point
+    // where the accumulator vector is resized for the current thread count.
     flush_thread_accumulators();
 
     // Accumulate time for transport

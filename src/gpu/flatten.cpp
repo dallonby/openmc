@@ -577,6 +577,18 @@ bool flatten_tallies(FlatModel& m)
       return reject(
         m, fmt::format("tally {} has more than {} filters (GPU v1 limit)",
              t->id(), GPU_MAX_TALLY_FILTERS));
+    {
+      int n_mesh_filters = 0;
+      for (int fi = 0; fi < (int)t->filters().size(); ++fi)
+        if (dynamic_cast<const MeshFilter*>(
+              model::tally_filters[t->filters(fi)].get()))
+          ++n_mesh_filters;
+      if (n_mesh_filters > 1)
+        return reject(m,
+          fmt::format("tally {} has {} mesh filters; the GPU scorer supports "
+                      "at most one",
+            t->id(), n_mesh_filters));
+    }
     if (t->deriv_ != C_NONE)
       return reject(
         m, fmt::format("tally {} is a differential tally (unsupported in "

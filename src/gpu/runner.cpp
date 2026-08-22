@@ -112,6 +112,14 @@ namespace {
 std::vector<uint8_t> gpu_leak_map;
 } // namespace
 
+namespace openmc {
+namespace gpu {
+//! set by finalize() so the next simulation in this process does not reuse
+//! the previous model's prefetched source sites
+bool gpu_prefetch_reset = true;
+} // namespace gpu
+} // namespace openmc
+
 void gpu_host_leak(int64_gpu id)
 {
   if (!gpu_leak_map.empty() && (size_t)(id - 1) < gpu_leak_map.size())
@@ -246,6 +254,7 @@ struct Engine {
   int64_t lost_total = 0;
   uint32_t n_red_slots = 0;
   uint32_t tally_replicas = 1;
+  uint64_t spill_uid_cursor = 0; // monotonic spill-id allocator
 };
 
 Engine eng;
@@ -426,6 +435,13 @@ void try_initialize()
          (size_t)eng.flat.tally_accum_size * eng.tally_replicas * 4 >
            (size_t)128 << 20)
     eng.tally_replicas >>= 1;
+  if (eng.tally_replicas < 8 && eng.flat.tally_accum_size > 0) {
+    warning(fmt::format(
+      "GPU tally accumulators fit only {} replica bank(s) ({} bins); very "
+      "large batches may lose small track contributions to fp32 rounding in "
+      "hot bins. Reduce particles per batch if tallies look low.",
+      eng.tally_replicas, eng.flat.tally_accum_size));
+  }
   int64_t bank_cap = 3 * n;
   if (omg_metal_buffer(eng.ctx, OMG_SLOT_CONTROL, sizeof(GpuControl)) ||
       omg_metal_buffer(
@@ -523,6 +539,14 @@ void transport_generation()
     settings::weight_window_checkpoint_surface ? 1u : 0u;
   ctl->spill_cap = ctl->fission_bank_cap;
   ctl->source_is_spill = 0u;
+  // Spilled secondaries draw particle ids from a space disjoint from the
+  // primaries' (id = batch*gen*n_particles stays far below 2^50), advanced
+  // by every spill already produced so ids never repeat across generations.
+  {
+    const uint64_t base = (1ull << 50) + eng.spill_uid_cursor;
+    ctl->spill_uid_lo = (uint32_t)(base & 0xffffffffull);
+    ctl->spill_uid_hi = (uint32_t)(base >> 32);
+  }
 
   // active tallies only (device scores every desc it is told about)
   bool tallies_active = false;
@@ -550,10 +574,8 @@ void transport_generation()
     g.delayed_group = s.delayed_group;
     g.parent_id = 0;
     g.progeny_id = 0;
-    g.seed_track_lo = 0;
-    g.seed_track_hi = 0;
-    g.seed_urr_lo = 0;
-    g.seed_urr_hi = 0;
+    g.uid_lo = 0;
+    g.uid_hi = 0;
     g.wgt_born = (float)s.wgt;
     g.wgt_ww_born = -1.0f; // unset: the first window lookup fixes it
     g.ww_factor = 0.0f;
@@ -568,7 +590,18 @@ void transport_generation()
   static std::vector<GpuSourceSite> prefetched;
   static double prefetched_weight = 0.0;
   static bool have_prefetch = false;
+  if (gpu_prefetch_reset) { // cleared by finalize(); see gpu_prefetch_reset
+    prefetched.clear();
+    prefetched_weight = 0.0;
+    have_prefetch = false;
+    gpu_prefetch_reset = false;
+  }
+  // Prefetch assumes the next generation's ids are simply +n_particles.
+  // With the shared secondary bank (which weight windows enable by default)
+  // compute_particle_id() also folds in simulation_tracks_completed, so that
+  // assumption breaks and the same source sites would be resampled.
   const bool prefetch_ok = settings::run_mode == RunMode::FIXED_SOURCE &&
+                           !settings::use_shared_secondary_bank &&
                            !std::getenv("OPENMC_GPU_NO_PREFETCH");
   if (std::getenv("OPENMC_GPU_PREFETCH_DEBUG"))
     std::fprintf(stderr,
@@ -1202,12 +1235,17 @@ void transport_generation()
       }
       eng.gpu_seconds += omg_metal_last_time(eng.ctx);
       reduce_keff((int64_t)take);
-      if (pass == max_passes - 1 && ctr0[GPU_CTR_SPILL] > 0)
-        warning(fmt::format(
-          "GPU variance reduction hit the {}-pass spill limit; {} secondaries "
-          "were not transported",
-          max_passes, ctr0[GPU_CTR_SPILL]));
+      if (pass == max_passes - 1 && ctr0[GPU_CTR_SPILL] > 0) {
+        // those sites carry real weight; abandoning them would bias the
+        // tally low, so stop rather than report a wrong answer
+        fatal_error(fmt::format(
+          "GPU variance reduction did not converge: {} secondaries still "
+          "banked after {} spill passes. Soften the weight windows or lower "
+          "max_split.",
+          ctr0[GPU_CTR_SPILL], max_passes));
+      }
     }
+    eng.spill_uid_cursor += ctr0[GPU_CTR_SPILL_SERIAL];
   }
   auto t_gen2 = std::chrono::steady_clock::now();
 
@@ -1388,6 +1426,7 @@ void transport_generation()
 
 void finalize()
 {
+  gpu_prefetch_reset = true;
   if (std::getenv("OPENMC_GPU_TIMING")) {
     std::fprintf(stderr,
       "[gpu-timing] host source/upload %.3f s, dispatch(wait) %.3f s "

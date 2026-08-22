@@ -155,13 +155,12 @@ struct GpuSourceSite {
   float wgt_ww_born; // weight window the history was born in (-1 = unset)
   float ww_factor;   // Particle::ww_factor()
   int32_gpu n_split; // cumulative splits of this history
-  // Parent RNG state at the moment of the split (tracking + URR streams,
-  // split into 32-bit halves to keep the struct 4-byte aligned). A spilled
-  // particle RESUMES this stream instead of deriving a seed from its
-  // re-dispatch thread id, which would replay a primary particle's stream
-  // and correlate the two histories.
-  uint32_gpu seed_track_lo, seed_track_hi;
-  uint32_gpu seed_urr_lo, seed_urr_hi;
+  // Unique particle id assigned at spill time (32-bit halves). Each spilled
+  // secondary seeds its streams from its OWN id: seeding from the
+  // re-dispatch thread id would replay a primary's stream, and copying the
+  // parent's state would make every sibling an identical particle. The id
+  // space is disjoint from primary ids and monotonic across generations.
+  uint32_gpu uid_lo, uid_hi;
 };
 
 // ---------------------------------------------------------------------------
@@ -306,7 +305,9 @@ struct GpuControl {
   uint32_gpu ww_checkpoint_collision;
   uint32_gpu ww_checkpoint_surface;
   uint32_gpu spill_cap;           // capacity of the spill bank
-  uint32_gpu source_is_spill;     // source sites carry their own RNG state
+  uint32_gpu source_is_spill;     // source sites carry their own particle id
+  uint32_gpu spill_uid_lo;        // base of the disjoint spill id space
+  uint32_gpu spill_uid_hi;
   // i32 arena: per-surface adjacency index (n_surfaces offsets, each to a
   // [count, cell...] list of the cells whose region references the surface)
   uint32_gpu surf_adj_off;
@@ -335,4 +336,7 @@ struct GpuTraceRec {
 // re-dispatch loop, and secondaries dropped because that bank was full
 #define GPU_CTR_SPILL 10
 #define GPU_CTR_SPILL_DROP 11
-#define GPU_CTR_COUNT 12
+// monotonic within a generation (never reset by the drain loop): supplies
+// each spilled secondary a unique particle id
+#define GPU_CTR_SPILL_SERIAL 12
+#define GPU_CTR_COUNT 13

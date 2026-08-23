@@ -810,6 +810,50 @@ bool flatten_ce(FlatModel& m)
     }
     m.materials.push_back(gm);
   }
+
+  // Majorant diagnostic: delta tracking samples flights from the global
+  // majorant and rejects down to the local total, so mean flights per real
+  // collision is majorant/local. Anything much above ~2 eats the geometry
+  // saving it is meant to buy.
+  if (std::getenv("OPENMC_GPU_MAJORANT")) {
+    const double Es[] = {0.0253, 1.0, 1.0e3, 1.0e5, 1.0e6, 2.0e6, 1.4e7};
+    std::fprintf(stderr, "[majorant] energy(eV)  per-material Sigma_t (1/cm)"
+                         "  -> majorant/local\n");
+    for (double E : Es) {
+      std::vector<double> sig(model::materials.size(), 0.0);
+      for (size_t mi = 0; mi < model::materials.size(); ++mi) {
+        const Material& mt = *model::materials[mi];
+        double tot = 0.0;
+        for (size_t j = 0; j < mt.nuclide_.size(); ++j) {
+          const Nuclide& nj = *data::nuclides[mt.nuclide_[j]];
+          int it = 0;
+          double bd = 1e300;
+          for (size_t t = 0; t < nj.kTs_.size(); ++t) {
+            double d = std::abs(nj.kTs_[t] - model_kT);
+            if (d < bd) { bd = d; it = (int)t; }
+          }
+          const auto& eg = nj.grid_[it].energy;
+          if (eg.empty()) continue;
+          size_t k = std::lower_bound(eg.begin(), eg.end(), E) - eg.begin();
+          if (k == 0) k = 1;
+          if (k >= eg.size()) k = eg.size() - 1;
+          double f = (eg[k] > eg[k-1]) ? (E - eg[k-1]) / (eg[k] - eg[k-1]) : 0.0;
+          f = std::min(1.0, std::max(0.0, f));
+          double xt = (1.0 - f) * nj.xs_[it](k-1, 0) + f * nj.xs_[it](k, 0);
+          tot += mt.atom_density_(j) * xt;
+        }
+        sig[mi] = tot;
+      }
+      double maj = 0.0;
+      for (double v : sig) maj = std::max(maj, v);
+      std::fprintf(stderr, "[majorant] %10.4g ", E);
+      for (double v : sig) std::fprintf(stderr, " %8.4f", v);
+      std::fprintf(stderr, "  -> maj=%.4f ratios:", maj);
+      for (double v : sig)
+        std::fprintf(stderr, " %.2fx", v > 0 ? maj / v : 0.0);
+      std::fprintf(stderr, "\n");
+    }
+  }
   return true;
 }
 

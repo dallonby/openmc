@@ -811,6 +811,99 @@ bool flatten_ce(FlatModel& m)
     m.materials.push_back(gm);
   }
 
+  const uint32_t n_log_bins = (uint32_t)settings::n_log_bins;
+  const double log_spacing = simulation::log_spacing;
+  const double energy_min = data::energy_min[0];
+
+  // ---- delta-tracking majorant table ----
+  // Sigma_maj(E) >= Sigma_t of every material at E. Binned on the existing
+  // log-energy grid and stored as the interval maximum, so the device lookup
+  // is one direct index. Sigma_t is piecewise linear between grid knots, so
+  // the maximum over an interval is max of its two endpoints -- taking that
+  // over every bin the interval touches is exact for the binned bound.
+  {
+    std::vector<float> maj((size_t)n_log_bins, 0.0f);
+    for (const auto& mp2 : model::materials) {
+      const Material& mt = *mp2;
+      if (mt.nuclide_.empty())
+        continue;
+      // union grid for this material
+      std::vector<float> ue;
+      std::vector<int> its(mt.nuclide_.size(), 0);
+      for (size_t j = 0; j < mt.nuclide_.size(); ++j) {
+        const Nuclide& nj = *data::nuclides[mt.nuclide_[j]];
+        double bd = 1e300;
+        for (size_t t = 0; t < nj.kTs_.size(); ++t) {
+          double d = std::abs(nj.kTs_[t] - model_kT);
+          if (d < bd) { bd = d; its[j] = (int)t; }
+        }
+        for (double v : nj.grid_[its[j]].energy)
+          ue.push_back((float)v);
+      }
+      std::sort(ue.begin(), ue.end());
+      ue.erase(std::unique(ue.begin(), ue.end()), ue.end());
+      if (ue.size() < 2)
+        continue;
+      // Sigma_t at each union point
+      std::vector<float> sig(ue.size(), 0.0f);
+      std::vector<size_t> cur(mt.nuclide_.size(), 0);
+      for (size_t k = 0; k < ue.size(); ++k) {
+        double tot = 0.0;
+        for (size_t j = 0; j < mt.nuclide_.size(); ++j) {
+          const Nuclide& nj = *data::nuclides[mt.nuclide_[j]];
+          const auto& eg = nj.grid_[its[j]].energy;
+          const auto& xj = nj.xs_[its[j]];
+          const size_t ng2 = eg.size();
+          size_t& c = cur[j];
+          while (c + 2 < ng2 && (float)eg[c + 1] <= ue[k])
+            ++c;
+          double xt;
+          if (ue[k] <= (float)eg[0])
+            xt = xj(0, 0);
+          else if (ue[k] >= (float)eg[ng2 - 1])
+            xt = xj(ng2 - 1, 0);
+          else {
+            double e0 = eg[c], e1 = eg[c + 1];
+            double f = (e1 > e0) ? (ue[k] - e0) / (e1 - e0) : 0.0;
+            xt = (1.0 - f) * xj(c, 0) + f * xj(c + 1, 0);
+          }
+          tot += mt.atom_density_(j) * xt;
+        }
+        sig[k] = (float)tot;
+      }
+      // spread each interval's maximum over every log bin it touches
+      for (size_t k = 0; k + 1 < ue.size(); ++k) {
+        float hi = std::max(sig[k], sig[k + 1]);
+        auto bin_of = [&](float E) {
+          if (E <= (float)energy_min)
+            return 0;
+          int b = (int)(std::log((double)E / energy_min) / log_spacing);
+          return std::min(std::max(b, 0), (int)n_log_bins - 1);
+        };
+        int b0 = bin_of(ue[k]), b1 = bin_of(ue[k + 1]);
+        for (int b = b0; b <= b1; ++b)
+          maj[(size_t)b] = std::max(maj[(size_t)b], hi);
+      }
+    }
+    // a bin with no data would let a flight be sampled from zero: carry the
+    // previous bin's bound forward rather than leave a hole
+    for (size_t b = 1; b < maj.size(); ++b)
+      if (maj[b] <= 0.0f)
+        maj[b] = maj[b - 1];
+    for (size_t b = maj.size(); b-- > 1;)
+      if (maj[b - 1] <= 0.0f)
+        maj[b - 1] = maj[b];
+    m.majorant_off = (int32_t)fx.f32_off();
+    for (float v : maj)
+      m.f32.push_back(v);
+    if (std::getenv("OPENMC_GPU_MAJORANT")) {
+      float mx = 0.0f;
+      for (float v : maj) mx = std::max(mx, v);
+      write_message(fmt::format("GPU majorant table: {} bins, peak {:.4f} /cm",
+                      n_log_bins, mx), 6);
+    }
+  }
+
   // Majorant diagnostic: delta tracking samples flights from the global
   // majorant and rejects down to the local total, so mean flights per real
   // collision is majorant/local. Anything much above ~2 eats the geometry

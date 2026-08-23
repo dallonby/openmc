@@ -45,6 +45,11 @@ struct FlatModel {
   std::vector<int32_t> tally_host_index; // model::tallies index per desc
   uint32_t tally_accum_size {0};
 
+  // delta tracking: f32 offset of the binned majorant table, or -1
+  int32_t majorant_off {-1};
+  //! empty when the model can use delta tracking; otherwise names the reason
+  std::string delta_reject;
+
   uint32_t mg_bin_avg_off {0};
   uint32_t mg_default_iv_off {0};
   uint32_t surf_adj_off {0};

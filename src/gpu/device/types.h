@@ -301,6 +301,15 @@ struct GpuControl {
   uint32_gpu tally_replicas;    // number of banks (power of two)
   // size of the persistent thread pool, or 0 for one thread per particle
   uint32_gpu n_work_threads;
+
+  // Delta tracking (Woodcock). majorant_off indexes an f32 table of
+  // n_log_bins entries holding the maximum macroscopic total cross section
+  // over every material anywhere in each log-energy bin. Because it only has
+  // to be a valid upper bound, binning it makes the lookup a single direct
+  // index with no search -- unlike the per-nuclide path it replaces.
+  // delta_tracking is 0 when the mode is off or the model is ineligible.
+  uint32_gpu delta_tracking;
+  uint32_gpu majorant_off;
   // ---- variance reduction (fixed-source, non-multiplying models only) ----
   uint32_gpu ww_on;               // weight windows active
   int32_gpu ww_mesh;              // index into meshes[] for the WW mesh

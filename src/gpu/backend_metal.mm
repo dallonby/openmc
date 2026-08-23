@@ -26,6 +26,10 @@ struct MetalCtx {
   std::string device_name;
 };
 
+// set while a one-shot GPU capture is open; cleared once the captured command
+// buffer has actually finished executing
+bool g_capturing = false;
+
 void set_err(char* err, int errcap, NSString* msg)
 {
   if (err && errcap > 0) {
@@ -89,6 +93,10 @@ int omg_metal_compile(void* vctx, const char* src, char* err, int errcap)
     // chains and visibly bias k-eff (observed ~-0.5% on Godiva);
     // correctness beats the modest ALU win.
     opts.mathMode = MTLMathModeSafe;
+    // keep sources in the compiled library so a GPU capture can attribute
+    // cost to source lines rather than raw instructions
+    if (std::getenv("OPENMC_GPU_CAPTURE"))
+      opts.libraryType = MTLLibraryTypeExecutable;
     id<MTLLibrary> lib =
       [ctx->device newLibraryWithSource:@(src) options:opts error:&nserr];
     if (!lib) {
@@ -202,6 +210,11 @@ int omg_metal_dispatch(
       return 1;
     }
     ctx->last_time = cb.GPUEndTime - cb.GPUStartTime;
+    if (g_capturing) {
+      g_capturing = false;
+      [[MTLCaptureManager sharedCaptureManager] stopCapture];
+      std::fprintf(stderr, "[gpu-capture] trace written\n");
+    }
     return 0;
   }
 }
@@ -229,6 +242,40 @@ int omg_metal_dispatch_async(
         return 1;
       }
       ctx->psos[name] = pso;
+    }
+
+    // ---- one-shot GPU capture ----
+    // OPENMC_GPU_CAPTURE=<path.gputrace> captures a single transport dispatch
+    // for Xcode. Needs MTL_CAPTURE_ENABLED=1 in the environment, and the path
+    // must not already exist.
+    static bool cap_done = false;
+    static int cap_skip = -1;
+    if (cap_skip < 0)
+      cap_skip = std::getenv("OPENMC_GPU_CAPTURE_SKIP")
+                   ? atoi(std::getenv("OPENMC_GPU_CAPTURE_SKIP"))
+                   : 0;
+    if (!cap_done && std::getenv("OPENMC_GPU_CAPTURE") &&
+        std::strcmp(fn, "openmc_transport") == 0 && cap_skip-- <= 0) {
+      cap_done = true;
+      const char* cp = std::getenv("OPENMC_GPU_CAPTURE");
+      MTLCaptureManager* cm = [MTLCaptureManager sharedCaptureManager];
+      if (![cm supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+        std::fprintf(stderr, "[gpu-capture] trace documents unsupported; is "
+                             "MTL_CAPTURE_ENABLED=1 set?\n");
+      } else {
+        MTLCaptureDescriptor* cd = [MTLCaptureDescriptor new];
+        cd.captureObject = ctx->queue;
+        cd.destination = MTLCaptureDestinationGPUTraceDocument;
+        cd.outputURL = [NSURL fileURLWithPath:@(cp)];
+        NSError* cerr = nil;
+        if (![cm startCaptureWithDescriptor:cd error:&cerr]) {
+          std::fprintf(stderr, "[gpu-capture] start failed: %s\n",
+            cerr.localizedDescription.UTF8String);
+        } else {
+          g_capturing = true;
+          std::fprintf(stderr, "[gpu-capture] capturing one dispatch -> %s\n", cp);
+        }
+      }
     }
 
     id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
@@ -271,6 +318,7 @@ int omg_metal_dispatch_async(
     [enc dispatchThreads:MTLSizeMake(nthreads, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+
     [cb commit];
     ctx->pending = cb;
     return 0;
@@ -291,6 +339,11 @@ int omg_metal_wait(void* vctx, char* err, int errcap)
       return 1;
     }
     ctx->last_time = cb.GPUEndTime - cb.GPUStartTime;
+    if (g_capturing) {
+      g_capturing = false;
+      [[MTLCaptureManager sharedCaptureManager] stopCapture];
+      std::fprintf(stderr, "[gpu-capture] trace written\n");
+    }
     return 0;
   }
 }

@@ -256,6 +256,7 @@ struct Engine {
   uint32_t tally_replicas = 1;
   uint64_t spill_uid_cursor = 0; // monotonic spill-id allocator
   double total_events = 0.0;     // summed device events (perf diagnostics)
+  double total_xseval = 0.0;     // summed cross-section evaluations
 };
 
 Engine eng;
@@ -1199,6 +1200,7 @@ void transport_generation()
     global_tally_absorption += sums[GPU_RED_K_ABSORPTION];
     global_tally_leakage += sums[GPU_RED_LEAKAGE];
     eng.total_events += sums[GPU_RED_EVENTS];
+    eng.total_xseval += sums[GPU_RED_XSEVAL];
   };
 
   // ---- dispatch in chunks, with interactivity-watchdog recovery ----
@@ -1552,9 +1554,10 @@ void finalize()
     if (eng.active) {
       write_message(
         fmt::format("GPU transport device time: {:.3f} s ({:.4g} events, "
-                    "{:.2f} ns/event)",
+                    "{:.2f} ns/event, {:.2f} xs evals/event)",
           eng.gpu_seconds, eng.total_events,
-          eng.total_events > 0 ? eng.gpu_seconds / eng.total_events * 1e9 : 0.0),
+          eng.total_events > 0 ? eng.gpu_seconds / eng.total_events * 1e9 : 0.0,
+          eng.total_events > 0 ? eng.total_xseval / eng.total_events : 0.0),
         6);
     }
     omg_metal_destroy(eng.ctx);

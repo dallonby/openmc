@@ -248,7 +248,13 @@ struct GpuTallyDesc {
 // per event rather than per particle, so timing probes that change how much
 // transport happens can still be compared fairly
 #define GPU_RED_EVENTS 4
-#define GPU_RED_WIDTH 5
+// cross-section evaluations. The result is cached across events at the same
+// (material, energy, density), so this bounds how much any cross-section-path
+// optimisation can win. Measured at 1.13 per event on the W slab: the cache
+// almost never hits, because energy changes at every collision and material
+// at every crossing.
+#define GPU_RED_XSEVAL 5
+#define GPU_RED_WIDTH 6
 
 struct GpuControl {
   uint32_gpu n_particles;   // particles this dispatch

@@ -873,6 +873,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
 
   // per-material micro cache (CE)
   GpuMicroXS micros[GPU_MAX_MAT_NUCLIDES];
+  uint32_gpu n_xseval = 0;
   // macro/micro XS cache: CPU skips recalculation when material, energy and
   // density multiplier are unchanged (a surface crossing changes none of
   // them), so a flight that ends at a boundary costs no XS lookups
@@ -932,6 +933,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       float mac_elastic = 0.0f;
       if (gs.material != xs_key_mat || E != xs_key_E ||
           gs.density_mult != xs_key_dm) {
+        ++n_xseval;
         xs_key_mat = gs.material;
         xs_key_E = E;
         xs_key_dm = gs.density_mult;
@@ -1764,6 +1766,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   banks.red_slots[slot + GPU_RED_K_ABSORPTION] = k_abs;
   banks.red_slots[slot + GPU_RED_LEAKAGE] = k_leak;
   banks.red_slots[slot + GPU_RED_EVENTS] = (float)n_events;
+  banks.red_slots[slot + GPU_RED_XSEVAL] = (float)n_xseval;
   // progeny count with the leak flag in the top bit (debug diagnostics)
   banks.progeny[ctl.source_offset + tid] =
     (uint32_gpu)n_progeny | (leaked << 31);

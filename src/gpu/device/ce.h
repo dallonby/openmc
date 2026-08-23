@@ -30,10 +30,13 @@ struct GpuNuclide {
   // f32: interleaved per-grid-point records, ascending in energy:
   //   [E, total, absorption]              (xs_stride = 3, non-fissionable)
   //   [E, total, absorption, fis, nu_fis] (xs_stride = 5, fissionable)
-  // Energy and cross sections share a cache line because the lookup is
-  // bound by random cache-line fetches, not by the search: a log-grid-bins
-  // sweep from 1e3 to 2e5 moved the W-slab kernel by <1%, while separate
-  // grid/xs arrays cost 2-3 lines per nuclide per collision.
+  // Energy and cross sections share a cache line so one fetch serves both.
+  // The search itself is not the cost: a log-grid-bins sweep from 1e3 to 2e5
+  // moved the W-slab kernel by <1%. Note the interleave measured SPEED-
+  // NEUTRAL (3.744 vs 3.740 s) and is kept for the ~40% memory saving, not
+  // for throughput -- a later unionized-material table cut distinct gathers
+  // 3.4x for 0%, so cross-section gathers are not what bounds this kernel.
+  // See PORT_NOTES "CE kernel cost investigation".
   uint32_gpu grid_off;
   uint32_gpu n_grid;
   uint32_gpu xs_stride;

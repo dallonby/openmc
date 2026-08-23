@@ -148,10 +148,15 @@ workload this port was built for — runs 4–6× a properly-tuned CPU, with
 the mesh-tally path (single shield cell + tracklength track splitting) at
 the top of that range.
 
-The remaining GPU levers (history-length divergence on long tungsten
-walks; the shared tally atomics that also cap the CPU) are the
-event-based/wavefront pipeline and threadgroup-local tally tiles, both on
-the roadmap.
+Both of those supposed levers have since been measured and neither is the
+constraint. History-length divergence is real (SIMD efficiency 10.9% on the
+W slab) but not binding: a persistent-thread work queue raises lane
+occupancy to 40% and buys only 9%. Tally atomics have ample headroom — a
+microbenchmark puts Apple's native float atomics at 27 G/s against the
+tally path's 14% share. An Xcode GPU capture shows the kernel is bandwidth
+bound at the last-level cache, with geometry the dominant consumer of
+global accesses, so the live lever is delta tracking, which removes
+surface-distance work rather than rearranging it. See PORT_NOTES.
 
 ## Variance reduction (fixed source)
 

@@ -377,70 +377,197 @@ from ~5e-5 to 0–2.4e-6 with no measurable throughput cost:
 Device-vs-replay bit identity was re-verified after the geometry
 changes: 0 disagreements on 2M paired Godiva histories.
 
-Review improvement backlog (not yet implemented): CE cross-section
-caching across non-collision events, per-thread micro-XS working-set
-reduction (occupancy), active-tally compaction + threadgroup-local tally
-reduction, optional wavefront pipeline for collision-heavy CE, compiled
-metallib caching keyed on source hash, a host-side arena validator, and
-full-width RNG-state traces.
+Review improvement backlog (not yet implemented): compiled metallib
+caching keyed on source hash, a host-side arena validator, and full-width
+RNG-state traces. Three former entries have since been measured and are
+recorded under "CE kernel cost investigation" below: per-thread micro-XS
+working-set reduction (falsified — thread-local footprint is not the
+limiter), CE cross-section caching across non-collision events (the cache
+already exists and hits rarely, 1.13 evaluations per event), and the
+wavefront pipeline (its compaction half is implemented as
+`OPENMC_GPU_PERSIST`, worth 9%, and length imbalance is not the binding
+constraint).
 
-## CE kernel cost investigation (2026-08-22)
+## CE kernel cost investigation (2026-08-22/23)
 
-Measured cost split of the device kernel on the W-slab ablation model
-(10M histories, 60 depth cells): cross sections 37%, geometry 35%,
-tallies 14%, remaining floor 24%. Attacking the cross-section share
-produced one win and a long list of falsified hypotheses; both are
-recorded because the negatives are what bound the remaining headroom.
+Two days of measurement on this kernel produced three landed wins, twelve
+falsified hypotheses, and — only at the end, from an Xcode GPU capture — a
+correct diagnosis. The negatives are recorded because they bound the
+remaining headroom, and because most of them were aimed at the wrong axis
+for a reason worth remembering.
 
-**Kept.** The URR probability-table band search was a forward linear
-scan over ~20 bands, run twice per in-band nuclide lookup. Neighbouring
-histories draw unrelated variates, so every SIMD group waited on its
-unluckiest lane. Replacing it with a binary search over the (monotone)
-CDF returns the identical index in log2(n) uniform steps: **-3.7%**
-device time (3.752 s -> 3.615 s, five runs each, non-overlapping), with
-Godiva k-eff reproducing the recorded 1.00138(71) exactly.
+### What the capture says (authoritative)
 
-Bounding measurement: `settings.ptables = False` removes 16.7% of the
-kernel, so URR table work is real and the band search recovered about a
-fifth of it. The rest is the table walks themselves.
+An Xcode Metal capture of `openmc_transport` on the thermal pincell,
+profiled per source line:
 
-**Falsified by measurement** (each reverted):
+| region | share |
+|---|---|
+| `gpu_distance_to_boundary` (geometry) | ~24% |
+| `gpu_ce_micro_xs` (cross sections)    | ~20% |
+| `gpu_score_tallies`                   | ~8%  |
+| crossing block (`local_find_cell_adj`, `cell_contains`) | ~12% |
+| collision block (sampling)            | ~20% |
 
-1. Binary-search length in the main XS lookup — `log_grid_bins` 1e3 to
-   2e5 moved the kernel <1%.
-2. Cache lines per lookup — interleaving `[E, total, absorption]` into
-   one record: 3.744 s vs 3.740 s. Kept anyway for the 40% memory cut,
-   not for speed.
-3. 64-byte hot-record split of `GpuNuclide` — no gain, reverted.
-4. Thread-local footprint / occupancy — `micros[]` inflated 5 -> 64
-   slots costs 1.1%, and 1 -> 5 slots on the single-nuclide model is
-   free (2.288 s -> 2.188 s). `OPENMC_GPU_FORCE_MAXNUC` exists to
-   re-run this. The per-thread micro-XS array is not the limiter.
-5. Instruction-level parallelism — `#pragma unroll 4` on the nuclide
-   loop: no change.
-6. URR entry-gate gathers — hoisting the band bounds into `GpuNuclide`
-   so an out-of-band history rejects from registers rather than three
-   dependent gathers: no gain. The cost is in-band work, not rejection.
-7. Precomputing the URR skip-ahead coefficients on the host (they
-   depend only on the nuclide index): no gain, the compiler was already
-   hoisting the loop-invariant chain.
+GPU counters on the same dispatch:
 
-`maxTotalThreadsPerThreadgroup` reports 1024 for this pipeline, which
-bounds the *register* allocation but says nothing about private stack
-residency — it should not be read as "not occupancy limited". What
-bounds it here is measurement: hypotheses 3-6 all target thread-local
-footprint and none of them moved the kernel.
+- ALU instructions 1,090,934,752 over 20,000 particles (~54,500 each);
+  **63.83% integer and conditional**, 21.15% float, 15.02% half
+- L1 at ~100% of peak performance, L1 eviction rate near maximum
+- Last-level-cache bandwidth 765 GiB/s against the M3 Ultra's ~800 GB/s
+- Occupancy manager ~100% of shader core resources
 
-Remaining headroom is therefore structural, not incremental:
-compile-time feature specialization (URR, S(a,b), tallies, VR and
-run mode are still runtime branches in a kernel that is already
-runtime-compiled per model) and the event-based/wavefront pipeline. For
-uniform 20-40 event tungsten histories the SIMD length-imbalance
-ceiling is only about 1.31x, so wavefront transport is worth its
-complexity for long-tailed thermal problems rather than for this one.
-An order-of-magnitude gain on deep-penetration work comes from variance
-reduction, not from the kernel: weight windows already deliver 9.4x FOM
-at 55 cm.
+Read together: the kernel is **bandwidth bound at the LLC**, L1 provides no
+relief because the working set vastly exceeds it so nearly every access
+evicts a line, and the large integer share is mostly *address arithmetic*
+feeding those accesses. Occupancy is adequate — which independently confirms
+the ballast result below. The dominant consumer of global accesses is
+**geometry**: surface-list iteration pulling indices and surface records out
+of the flattened arenas.
+
+**This corrects an earlier claim in this file.** A previous revision recorded
+the split as cross sections 37% / geometry 35%, measured by a 1-vs-5 nuclide
+ablation. That ablation changed the physics as well as the lookup count, and
+its number was wrong. It then propagated: it justified treating cross
+sections as the bottleneck, motivated the unionized table, framed the memory
+probe, and set the shared/divergent estimate used to scope bucketing. One
+unvalidated foundational measurement produced four downstream errors.
+
+### Divergence, measured in-kernel
+
+`sum(events) / (width * max(events))` per SIMD group, and agreement at the
+crossing-vs-collision branch:
+
+| model   | SIMD efficiency | path agreement | fully converged |
+|---------|-----------------|----------------|-----------------|
+| W slab  | 10.9%           | 83.8%          | 56.3%           |
+| Godiva  | 23.7%           | 81.6%          | 5.3%            |
+| pincell | 46.3%           | 84.7%          | 4.4%            |
+
+The two mechanisms trade off. The W slab looks convergent only because so few
+lanes are live (at ~3 active lanes and 84% majority, 0.84^3 ~ 0.59, matching
+the 56%); its problem is length imbalance. The pincell is the reverse — busy
+lanes that almost never agree. Branch outcomes are 16.0% collide / 84.0%
+cross on the pincell, 48.8% / 51.2% on the W slab.
+
+### Landed
+
+- **Threadgroup 1024 + skipping the per-nuclide macroscopic elastic loop when
+  no tally scores elastic**: +12%.
+- **Binary search over the URR band CDF**, replacing a forward linear scan run
+  twice per in-band lookup: **-3.7%** (3.752 -> 3.615 s, five runs each,
+  non-overlapping). Godiva k-eff reproduced 1.00138(71) exactly.
+- **Persistent-thread compaction** (`OPENMC_GPU_PERSIST=<n>`), a fixed thread
+  pool pulling from an atomic work cursor so a lane finishing a short history
+  starts another: **-9%** on the W slab at 1e6 particles. Opt-in: the useful
+  pool size is model-dependent, too small a pool costs 78%, and it never
+  engages for small batches (Godiva runs 10000 particles per generation).
+
+### Falsified by measurement
+
+Each was reverted unless noted.
+
+1. Binary-search length in the main XS lookup — `log_grid_bins` 1e3 to 2e5
+   moved the kernel <1%.
+2. Cache lines per lookup — interleaving `[E, total, absorption]`: 3.744 vs
+   3.740 s. Kept for a 40% memory cut, not for speed.
+3. 64-byte hot-record split of `GpuNuclide` — no gain.
+4. Thread-local footprint — `micros[]` 5 -> 64 slots costs 1.1%; 1 -> 5 on the
+   single-nuclide model is free. `OPENMC_GPU_FORCE_MAXNUC` re-runs it.
+5. Instruction-level parallelism — `#pragma unroll 4`: no change.
+6. URR entry-gate gathers — hoisting band bounds into `GpuNuclide`: no gain.
+   The cost is in-band work, not rejection.
+7. Host-precomputing the URR skip-ahead coefficients: no gain; the compiler
+   already hoists the loop-invariant chain.
+8. Secondary-stack size — `OPENMC_GPU_SEC_STACK` 8 -> 1: flat within noise.
+9. Live private state — `OPENMC_GPU_BALLAST` adding 128 B to 2 KB moves the
+   kernel <=12%, non-monotonically. A synthetic benchmark showed a 3.3x
+   spread across the same range; it does not transfer to this kernel.
+10. Dead-stripping the never-executed multigroup path by specializing `is_ce`
+    at MSL compile time: no change. Badly designed — `is_ce` is uniform across
+    every thread, so that branch never diverged and the code was never
+    fetched.
+11. **Per-material unionized cross-section table** — one energy grid per
+    material with macro totals and every nuclide's micro total contiguous, so
+    a lookup is one hash probe and two adjacent gathers instead of a gather
+    chain per nuclide. Exact (identical event counts and leakage; poisoning
+    the fast path moved leakage 1.11746 -> 1.16885, proving it live) and only
+    5.7 MB. **Zero gain** on all three models. Even allowing ~2 extra probes
+    for the denser grid, a lookup is ~8 gathers against ~27: a 3.4x cut in
+    distinct gathers for 0%.
+12. History-length compaction as the *binding* constraint — raising lane
+    occupancy from 11.4% to 40.1% produced a setting *slower* than one at
+    14.6%. Across the sweep, efficiency is anti-correlated with speed.
+
+Diagnostics retained: `OPENMC_GPU_FORCE_MAXNUC`, `OPENMC_GPU_SEC_STACK`,
+`OPENMC_GPU_BALLAST`, `OPENMC_GPU_CHUNK`, `OPENMC_GPU_PERSIST`,
+`OPENMC_GPU_MAJORANT`, `OPENMC_GPU_CAPTURE[_SKIP]`, and an always-on readout
+of events, cross-section evaluations per event, SIMD efficiency and path
+agreement on the device-time line. Cross-section evaluations run at 1.13 per
+event on the W slab — the cache almost never hits, because energy changes at
+every collision and material at every crossing.
+
+### What this implies
+
+Every optimisation tried across those twelve attempts *rearranged* memory
+accesses — layout, interleaving, unionizing, working set, thread-local
+footprint. The counters say rearranging cannot help: L1 is thrashing
+completely and the LLC is at its bandwidth ceiling. Only **reducing the
+number of accesses** helps, and the largest consumer is geometry.
+
+`maxTotalThreadsPerThreadgroup` reports 1024 for this pipeline. That bounds
+*register* allocation and says nothing about private-stack residency or
+achieved occupancy — a synthetic kernel 3.3x slower reports the same 1024.
+It should never be read as an occupancy signal.
+
+An order-of-magnitude gain on deep-penetration work does not come from the
+kernel. Weight windows already deliver 9.4x FOM at 55 cm.
+
+## Delta tracking (in progress, 2026-08-23)
+
+Woodcock tracking removes surface-distance computation — the largest single
+cost and the heaviest consumer of global accesses — rather than making it
+cheaper. Landed so far, all behaviour-neutral:
+
+- **Binned majorant table.** `Sigma_maj(E) >= Sigma_t` of every material,
+  binned on the existing log-energy grid as the interval maximum. A majorant
+  only has to be a valid upper bound, so binning makes the device lookup one
+  direct index with no search. 8000 bins, ~32 KB. `Sigma_t` is piecewise
+  linear between knots, so an interval maximum is the larger endpoint taken
+  over every bin it touches; empty bins are filled from neighbours in both
+  directions, since a zero there would sample an infinite mean free path.
+- **Boundary-condition surface list**, `gpu_distance_to_bc`, `gpu_majorant`,
+  control wiring, and an eligibility gate.
+
+Rejection cost measured with `OPENMC_GPU_MAJORANT`: the W slab is 1.00x at
+every energy (single material, no rejection at all) and the pincell 1.0-5.5x,
+roughly 1.3-1.5x flux-weighted. Affordable.
+
+**Constraints discovered while building it.** Delta tracking jumps a sampled
+distance without knowing which cells were traversed, so there are no path
+lengths per bin:
+
+- Track-length tallies are unusable; collision estimators are the remedy. The
+  gate therefore *refuses* the mode rather than silently changing an
+  estimator. Both benchmark models are currently refused — the pincell and the
+  W slab both tally track-length — so exercising it needs collision-estimator
+  variants.
+- `transport.h` accumulates the track-length k-eff estimator
+  (`k_tl += wgt * distance * xs.nu_fission`). Under delta tracking a flight
+  spans materials, so `k_tl` is invalid and the *combined* k-eff would be
+  wrong unless suppressed. Validation cannot use "Combined k-effective".
+- Mesh tallies are track-length by nature and hit the same wall.
+- It is the wrong trade for deep-penetration shielding regardless. With 1 cm
+  cells and tungsten at 0.33-0.59 /cm, only 28-45% of traversals collide, so
+  the collision estimator raises variance ~3x. Against a ~28% runtime saving
+  that is FOM (1/3)/0.78 ~ 0.43, a net 2.3x loss. Worse, `cp_shield.py` has
+  void source and back cells, where a global majorant makes every flight a
+  virtual collision.
+
+Remaining: the event-loop restructure (the delta path must move and relocate
+*before* evaluating cross sections, the reverse of surface tracking),
+virtual-collision handling, boundary handling on the delta path, `k_tl`
+suppression, and validation against a CPU reference.
 
 ## Deep-penetration acceptance (2026-08-21, fixed-source mode)
 

@@ -28,7 +28,10 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   device const GpuSabTable* sab_tables [[buffer(20)]],
   uint tid [[thread_position_in_grid]])
 {
-  if (tid >= ctl.n_particles)
+  // Persistent threads: when ctl.n_work_threads is set the grid is a fixed
+  // pool and each thread pulls particle indices from a shared cursor. When it
+  // is 0 the grid is one thread per particle (original behaviour).
+  if (ctl.n_work_threads == 0 && tid >= ctl.n_particles)
     return;
 
   GpuGeomData geom;
@@ -83,16 +86,31 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   banks.red_slots = red_slots;
   banks.trace = trace_buf;
 
-  gpu_run_particle(tid, ctl, geom, mg, ce, sab, tv, banks);
+  float ev = 0.0f;
+  if (ctl.n_work_threads == 0) {
+    gpu_run_particle(tid, ctl, geom, mg, ce, sab, tv, banks);
+    ev = red_slots[tid * GPU_RED_WIDTH + GPU_RED_EVENTS];
+  } else {
+    for (;;) {
+      uint32_gpu i = gpu_atomic_add_u32(counters + GPU_CTR_WORK, 1u);
+      if (i >= ctl.n_particles)
+        break;
+      gpu_run_particle(i, ctl, geom, mg, ce, sab, tv, banks);
+      ev += red_slots[i * GPU_RED_WIDTH + GPU_RED_EVENTS];
+    }
+  }
 
-  // History-length divergence: the group runs until its longest history
-  // finishes, so lanes that ended early are masked from there on.
-  float ev = red_slots[tid * GPU_RED_WIDTH + GPU_RED_EVENTS];
+  // Lane utilisation over the whole dispatch: the group cannot retire until
+  // its busiest lane is done, so this is the fraction of lane-slots that did
+  // real work. Accumulated through counters because with a work queue a
+  // thread no longer maps to one particle slot.
   float mx = simd_max(ev);
   float sm = simd_sum(ev);
   float width = (float)simd_sum(1.0f);
-  red_slots[tid * GPU_RED_WIDTH + GPU_RED_SIMDEFF] =
-    (mx > 0.0f && width > 0.0f) ? sm / (width * mx) : 0.0f;
+  float eff = (mx > 0.0f && width > 0.0f) ? sm / (width * mx) : 0.0f;
+  gpu_atomic_add_u32(
+    counters + GPU_CTR_SIMDEFF_ACC, (uint32_gpu)(eff * 10000.0f));
+  gpu_atomic_add_u32(counters + GPU_CTR_SIMDEFF_N, 1u);
 }
 
 // Math-function probe: y = f(x) for the host to compare against libm

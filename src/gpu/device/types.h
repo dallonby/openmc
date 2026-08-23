@@ -254,12 +254,7 @@ struct GpuTallyDesc {
 // almost never hits, because energy changes at every collision and material
 // at every crossing.
 #define GPU_RED_XSEVAL 5
-// SIMD-group efficiency for the history loop: sum(events) / (width *
-// max(events)) across the group. This is the fraction of lane-slots doing
-// real work while the group's longest history runs; everything else is
-// masked off. Bounds what staging the kernel by operation type could win.
-#define GPU_RED_SIMDEFF 6
-#define GPU_RED_WIDTH 7
+#define GPU_RED_WIDTH 6
 
 struct GpuControl {
   uint32_gpu n_particles;   // particles this dispatch
@@ -304,6 +299,8 @@ struct GpuControl {
   // deep-penetration front bin, -0.07% at 1e6).
   uint32_gpu tally_accum_stride; // floats per bank (= tally_accum_size)
   uint32_gpu tally_replicas;    // number of banks (power of two)
+  // size of the persistent thread pool, or 0 for one thread per particle
+  uint32_gpu n_work_threads;
   // ---- variance reduction (fixed-source, non-multiplying models only) ----
   uint32_gpu ww_on;               // weight windows active
   int32_gpu ww_mesh;              // index into meshes[] for the WW mesh
@@ -360,4 +357,14 @@ struct GpuTraceRec {
 // monotonic within a generation (never reset by the drain loop): supplies
 // each spilled secondary a unique particle id
 #define GPU_CTR_SPILL_SERIAL 12
-#define GPU_CTR_COUNT 13
+
+// Persistent-thread work queue: threads pull particle indices from this
+// cursor rather than owning one particle each, so a lane that finishes a
+// short history starts another instead of idling until its group's longest
+// history completes. One atomic per history, which at a measured 27 G
+// atomic/s is ~37 us per million particles against a ~400 ms kernel.
+#define GPU_CTR_WORK 13
+// SIMD efficiency accumulation (eff * 10000, and the thread count)
+#define GPU_CTR_SIMDEFF_ACC 14
+#define GPU_CTR_SIMDEFF_N 15
+#define GPU_CTR_COUNT 16

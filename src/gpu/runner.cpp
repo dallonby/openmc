@@ -537,6 +537,11 @@ void transport_generation()
   ctl->free_gas_threshold = (float)settings::free_gas_threshold;
   ctl->tally_accum_stride = eng.flat.tally_accum_size;
   ctl->tally_replicas = eng.tally_replicas;
+  // compaction prototype: a fixed pool of persistent threads pulling from a
+  // work queue, so lanes that finish short histories refill instead of idling
+  ctl->n_work_threads = 0;
+  if (const char* e = std::getenv("OPENMC_GPU_PERSIST"))
+    ctl->n_work_threads = (uint32_t)std::max(0, atoi(e));
   ctl->surf_adj_off = eng.flat.surf_adj_off;
   // variance reduction (fixed-source only; flatten enforces that)
   ctl->survival_biasing = settings::survival_biasing ? 1u : 0u;
@@ -1203,8 +1208,6 @@ void transport_generation()
     global_tally_leakage += sums[GPU_RED_LEAKAGE];
     eng.total_events += sums[GPU_RED_EVENTS];
     eng.total_xseval += sums[GPU_RED_XSEVAL];
-    eng.simdeff_sum += sums[GPU_RED_SIMDEFF];
-    eng.simdeff_n += (double)n_slots;
   };
 
   // ---- dispatch in chunks, with interactivity-watchdog recovery ----
@@ -1273,9 +1276,17 @@ void transport_generation()
       ctl->source_offset = offset;
       std::memset(omg_metal_contents(eng.ctx, OMG_SLOT_REDSLOTS), 0,
         (size_t)count * GPU_RED_WIDTH * 4);
+      {
+        auto* c = static_cast<uint32_t*>(
+          omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
+        c[GPU_CTR_WORK] = 0;
+      }
       snapshot_accum();
+      const uint32_t grid = ctl->n_work_threads
+                              ? std::min(ctl->n_work_threads, count)
+                              : count;
       bool bad = omg_metal_dispatch_async(
-        eng.ctx, "openmc_transport", count, err, sizeof(err));
+        eng.ctx, "openmc_transport", grid, err, sizeof(err));
       if (!bad) {
         if (prefetch)
           do_prefetch();
@@ -1303,6 +1314,16 @@ void transport_generation()
       first != 0);
   ctl->n_particles = (uint32_t)n;
   ctl->source_offset = 0;
+  {
+    auto* c =
+      static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
+    if (c[GPU_CTR_SIMDEFF_N] > 0) {
+      eng.simdeff_sum += c[GPU_CTR_SIMDEFF_ACC] / 10000.0;
+      eng.simdeff_n += c[GPU_CTR_SIMDEFF_N];
+      c[GPU_CTR_SIMDEFF_ACC] = 0;
+      c[GPU_CTR_SIMDEFF_N] = 0;
+    }
+  }
 
 
   // ---- spill drain: weight-window splits and (n,xn) clones that did not

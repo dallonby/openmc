@@ -244,7 +244,11 @@ struct GpuTallyDesc {
 #define GPU_RED_K_COLLISION 1
 #define GPU_RED_K_ABSORPTION 2
 #define GPU_RED_LEAKAGE 3
-#define GPU_RED_WIDTH 4
+// per-particle event count, summed on the host: lets kernel cost be quoted
+// per event rather than per particle, so timing probes that change how much
+// transport happens can still be compared fairly
+#define GPU_RED_EVENTS 4
+#define GPU_RED_WIDTH 5
 
 struct GpuControl {
   uint32_gpu n_particles;   // particles this dispatch

@@ -1763,6 +1763,7 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   banks.red_slots[slot + GPU_RED_K_COLLISION] = k_col;
   banks.red_slots[slot + GPU_RED_K_ABSORPTION] = k_abs;
   banks.red_slots[slot + GPU_RED_LEAKAGE] = k_leak;
+  banks.red_slots[slot + GPU_RED_EVENTS] = (float)n_events;
   // progeny count with the leak flag in the top bit (debug diagnostics)
   banks.progeny[ctl.source_offset + tid] =
     (uint32_gpu)n_progeny | (leaked << 31);

@@ -47,6 +47,8 @@ struct FlatModel {
 
   // delta tracking: f32 offset of the binned majorant table, or -1
   int32_t majorant_off {-1};
+  uint32_t bc_surf_off {0};
+  uint32_t n_bc_surf {0};
   //! empty when the model can use delta tracking; otherwise names the reason
   std::string delta_reject;
 

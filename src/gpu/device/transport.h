@@ -801,6 +801,47 @@ DEVICE_FN void gpu_apply_weight_window(GCONST GpuControl& ctl, GpuTallyView tv,
 }
 
 //! Full history for one source particle. Mirrors the CPU event loop.
+//! Distance to the nearest boundary-condition surface. Delta tracking may
+//! jump any distance through the interior, but not past a reflector or out
+//! through vacuum unnoticed, so these few surfaces are still tested on every
+//! flight -- typically one to six, against the full nested cell walk that
+//! surface tracking needs.
+DEVICE_FN GpuBoundary gpu_distance_to_bc(
+  GpuGeomData geom, GCONST GpuControl& ctl, THREAD GpuGeomState* p)
+{
+  GpuBoundary info;
+  info.d = GPU_INFTY;
+  info.surface = GPU_SURFACE_NONE;
+  info.coord_level = 1;
+  info.lat_trans[0] = 0;
+  info.lat_trans[1] = 0;
+  info.lat_trans[2] = 0;
+  GpuVec3 r = p->coord[0].r;
+  GpuVec3 u = p->coord[0].u;
+  for (uint32_gpu k = 0; k < ctl.n_bc_surf; ++k) {
+    int32_gpu is = geom.i32[ctl.bc_surf_off + k];
+    float d = gpu_surf_distance(geom, is, r, u, p->surface, 0);
+    if (d < info.d) {
+      info.d = d;
+      GpuVec3 hit = gpu_add(r, gpu_scale(u, d));
+      GpuVec3 nrm = gpu_surf_normal(geom, is, hit);
+      info.surface = (gpu_dot(u, nrm) > 0.0f) ? (is + 1) : -(is + 1);
+    }
+  }
+  return info;
+}
+
+//! Majorant at this energy: one direct index, no search.
+DEVICE_FN float gpu_majorant(GpuCeView ce, GCONST GpuControl& ctl, float E)
+{
+  int32_gpu ib = (int32_gpu)(logf(E / ce.energy_min) / ce.log_spacing);
+  if (ib < 0)
+    ib = 0;
+  if (ib >= (int32_gpu)ce.n_log_bins)
+    ib = (int32_gpu)ce.n_log_bins - 1;
+  return ce.f32[ctl.majorant_off + ib];
+}
+
 DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   GpuGeomData geom, GpuMgView mg, GpuCeView ce, GpuSabView sab,
   GpuTallyView tv, GpuBanks banks)

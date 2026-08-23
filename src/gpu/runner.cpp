@@ -540,6 +540,38 @@ void transport_generation()
   ctl->free_gas_threshold = (float)settings::free_gas_threshold;
   ctl->tally_accum_stride = eng.flat.tally_accum_size;
   ctl->tally_replicas = eng.tally_replicas;
+
+  // ---- delta tracking (opt-in) ----
+  // Refused when any active tally is track-length: delta tracking jumps a
+  // sampled distance without knowing which cells were traversed, so there is
+  // no path length per bin to score. Collision estimators are the remedy,
+  // but silently switching one would change a user's answer, so the mode
+  // declines instead.
+  ctl->majorant_off = (uint32_t)std::max(0, eng.flat.majorant_off);
+  ctl->bc_surf_off = eng.flat.bc_surf_off;
+  ctl->n_bc_surf = eng.flat.n_bc_surf;
+  ctl->delta_tracking = 0;
+  if (std::getenv("OPENMC_GPU_DELTA") && settings::run_CE &&
+      eng.flat.majorant_off >= 0) {
+    const char* why = nullptr;
+    for (const auto& t : eng.flat.tallies)
+      if (t.estimator == GPU_ESTIMATOR_TRACKLENGTH)
+        why = "an active tally uses the track-length estimator";
+    if (!why && eng.flat.n_bc_surf == 0)
+      why = "the model has no boundary-condition surfaces";
+    if (why) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        warning(fmt::format(
+          "GPU delta tracking requested but not used: {}. Falling back to "
+          "surface tracking.",
+          why));
+      }
+    } else {
+      ctl->delta_tracking = 1;
+    }
+  }
   // compaction prototype: a fixed pool of persistent threads pulling from a
   // work queue, so lanes that finish short histories refill instead of idling
   ctl->n_work_threads = 0;

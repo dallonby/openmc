@@ -310,6 +310,12 @@ struct GpuControl {
   // delta_tracking is 0 when the mode is off or the model is ineligible.
   uint32_gpu delta_tracking;
   uint32_gpu majorant_off;
+  // Surfaces carrying a non-transmissive boundary condition, precomputed so
+  // delta tracking can test only those. A particle must not jump past a
+  // reflector, but the outer boundary is typically 1-6 surfaces against the
+  // full nested cell walk that surface tracking needs on every flight.
+  uint32_gpu bc_surf_off; // i32 arena: n_bc_surf 0-based surface indices
+  uint32_gpu n_bc_surf;
   // ---- variance reduction (fixed-source, non-multiplying models only) ----
   uint32_gpu ww_on;               // weight windows active
   int32_gpu ww_mesh;              // index into meshes[] for the WW mesh

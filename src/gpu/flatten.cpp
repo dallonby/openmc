@@ -52,6 +52,7 @@ uint32_t push_f32(FlatModel& m, const double* vals, size_t n)
 bool flatten_surfaces(FlatModel& m)
 {
   m.surfaces.clear();
+  std::vector<int32_t> bc_surfaces;
   for (const auto& sp : model::surfaces) {
     const Surface* s = sp.get();
     GpuSurface gs {};
@@ -165,7 +166,15 @@ bool flatten_surfaces(FlatModel& m)
     }
     gs.coeff_off = push_f32(m, c, nc);
     m.surfaces.push_back(gs);
+    if (gs.bc != GPU_BC_TRANSMISSION)
+      bc_surfaces.push_back((int32_t)(m.surfaces.size() - 1));
   }
+  // delta tracking tests only these; a particle must not jump past a
+  // reflector, but this is 1-6 surfaces rather than the full nested walk
+  m.bc_surf_off = (uint32_t)m.i32.size();
+  m.n_bc_surf = (uint32_t)bc_surfaces.size();
+  for (int32_t v : bc_surfaces)
+    m.i32.push_back(v);
   return true;
 }
 

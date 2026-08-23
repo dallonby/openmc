@@ -876,6 +876,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   uint32_gpu n_xseval = 0;
   float pconv_sum = 0.0f;
   float pfull_sum = 0.0f;
+  uint32_gpu n_coll = 0;
+  uint32_gpu n_cross = 0;
   uint32_gpu pconv_n = 0;
   // macro/micro XS cache: CPU skips recalculation when material, energy and
   // density multiplier are unchanged (a surface crossing changes none of
@@ -1093,6 +1095,10 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
           pfull_sum += (nc == 0.0f || nc == w) ? 1.0f : 0.0f;
           ++pconv_n;
         }
+        if (coll > 0.0f)
+          ++n_coll;
+        else
+          ++n_cross;
       }
 #endif
       if (d_coll > gs.boundary.d) {
@@ -1790,6 +1796,8 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
     gpu_atomic_add_u32(banks.counters + GPU_CTR_PATHFULL_ACC,
       (uint32_gpu)(pfull_sum / (float)pconv_n * 100.0f));
     gpu_atomic_add_u32(banks.counters + GPU_CTR_PATHCONV_N, 1u);
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_COLLISION, n_coll);
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_CROSSING, n_cross);
   }
 #endif
   // progeny count with the leak flag in the top bit (debug diagnostics)

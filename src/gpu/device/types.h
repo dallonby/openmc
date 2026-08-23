@@ -378,4 +378,7 @@ struct GpuTraceRec {
 // lane forces the group to execute both blocks, so only fully converged
 // encounters actually save the other block's time.
 #define GPU_CTR_PATHFULL_ACC 18
-#define GPU_CTR_COUNT 19
+// collision events, to split the event total into the two branch outcomes
+#define GPU_CTR_COLLISION 19
+#define GPU_CTR_CROSSING 20
+#define GPU_CTR_COUNT 21

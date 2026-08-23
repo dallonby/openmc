@@ -1416,6 +1416,12 @@ void transport_generation()
       "non-deterministic.",
       ctr[GPU_CTR_FISSION_BANK], ctl->fission_bank_cap));
   }
+  if (std::getenv("OPENMC_GPU_TIMING"))
+    std::fprintf(stderr,
+      "[gpu-branch] collisions=%u crossings=%u (%.1f%% collide)\n",
+      ctr[GPU_CTR_COLLISION], ctr[GPU_CTR_CROSSING],
+      100.0 * ctr[GPU_CTR_COLLISION] /
+        std::max(1u, ctr[GPU_CTR_COLLISION] + ctr[GPU_CTR_CROSSING]));
   uint32_t n_lost = ctr[GPU_CTR_LOST];
   if (n_lost > 0) {
     eng.lost_total += n_lost;

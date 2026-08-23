@@ -874,6 +874,9 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   // per-material micro cache (CE)
   GpuMicroXS micros[GPU_MAX_MAT_NUCLIDES];
   uint32_gpu n_xseval = 0;
+  float pconv_sum = 0.0f;
+  float pfull_sum = 0.0f;
+  uint32_gpu pconv_n = 0;
   // macro/micro XS cache: CPU skips recalculation when material, energy and
   // density multiplier are unchanged (a surface crossing changes none of
   // them), so a flight that ends at a boundary costs no XS lookups
@@ -1079,6 +1082,19 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
       if (distance > GPU_TINY_BIT)
         gs.surface = GPU_SURFACE_NONE;
 
+#if defined(GPU_TARGET_METAL)
+      {
+        // how many active lanes take each side of this branch
+        float coll = (d_coll > gs.boundary.d) ? 0.0f : 1.0f;
+        float nc = simd_sum(coll);
+        float w = simd_sum(1.0f);
+        if (w > 0.0f) {
+          pconv_sum += fmaxf(nc, w - nc) / w;
+          pfull_sum += (nc == 0.0f || nc == w) ? 1.0f : 0.0f;
+          ++pconv_n;
+        }
+      }
+#endif
       if (d_coll > gs.boundary.d) {
         // ---- event_cross_surface ----
         gs.surface = gs.boundary.surface;
@@ -1767,6 +1783,15 @@ DEVICE_FN void gpu_run_particle(uint32_gpu tid, GCONST GpuControl& ctl,
   banks.red_slots[slot + GPU_RED_LEAKAGE] = k_leak;
   banks.red_slots[slot + GPU_RED_EVENTS] = (float)n_events;
   banks.red_slots[slot + GPU_RED_XSEVAL] = (float)n_xseval;
+#if defined(GPU_TARGET_METAL)
+  if (pconv_n > 0) {
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_PATHCONV_ACC,
+      (uint32_gpu)(pconv_sum / (float)pconv_n * 100.0f));
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_PATHFULL_ACC,
+      (uint32_gpu)(pfull_sum / (float)pconv_n * 100.0f));
+    gpu_atomic_add_u32(banks.counters + GPU_CTR_PATHCONV_N, 1u);
+  }
+#endif
   // progeny count with the leak flag in the top bit (debug diagnostics)
   banks.progeny[ctl.source_offset + tid] =
     (uint32_gpu)n_progeny | (leaked << 31);

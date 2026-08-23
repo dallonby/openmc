@@ -109,7 +109,7 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   float width = (float)simd_sum(1.0f);
   float eff = (mx > 0.0f && width > 0.0f) ? sm / (width * mx) : 0.0f;
   gpu_atomic_add_u32(
-    counters + GPU_CTR_SIMDEFF_ACC, (uint32_gpu)(eff * 10000.0f));
+    counters + GPU_CTR_SIMDEFF_ACC, (uint32_gpu)(eff * 100.0f));
   gpu_atomic_add_u32(counters + GPU_CTR_SIMDEFF_N, 1u);
 }
 

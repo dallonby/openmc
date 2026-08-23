@@ -367,4 +367,15 @@ struct GpuTraceRec {
 // SIMD efficiency accumulation (eff * 10000, and the thread count)
 #define GPU_CTR_SIMDEFF_ACC 14
 #define GPU_CTR_SIMDEFF_N 15
-#define GPU_CTR_COUNT 16
+// Path agreement at the crossing-vs-collision branch: of the lanes still
+// active in the event loop, the fraction on the majority side. This is the
+// divergence that bucketing particles by operation would remove, and it is
+// independent of the lane-occupancy figure above.
+#define GPU_CTR_PATHCONV_ACC 16
+#define GPU_CTR_PATHCONV_N 17
+// Fraction of branch encounters where EVERY active lane took the same side.
+// This is the number that decides what bucketing could win: one dissenting
+// lane forces the group to execute both blocks, so only fully converged
+// encounters actually save the other block's time.
+#define GPU_CTR_PATHFULL_ACC 18
+#define GPU_CTR_COUNT 19

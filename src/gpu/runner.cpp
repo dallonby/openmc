@@ -259,6 +259,9 @@ struct Engine {
   double total_xseval = 0.0;     // summed cross-section evaluations
   double simdeff_sum = 0.0;      // summed per-thread SIMD-group efficiency
   double simdeff_n = 0.0;
+  double pathconv_sum = 0.0;    // branch agreement at crossing-vs-collision
+  double pathconv_n = 0.0;
+  double pathfull_sum = 0.0;    // fraction of encounters fully converged
 };
 
 Engine eng;
@@ -1318,10 +1321,18 @@ void transport_generation()
     auto* c =
       static_cast<uint32_t*>(omg_metal_contents(eng.ctx, OMG_SLOT_COUNTERS));
     if (c[GPU_CTR_SIMDEFF_N] > 0) {
-      eng.simdeff_sum += c[GPU_CTR_SIMDEFF_ACC] / 10000.0;
+      eng.simdeff_sum += c[GPU_CTR_SIMDEFF_ACC] / 100.0;
       eng.simdeff_n += c[GPU_CTR_SIMDEFF_N];
       c[GPU_CTR_SIMDEFF_ACC] = 0;
       c[GPU_CTR_SIMDEFF_N] = 0;
+    }
+    if (c[GPU_CTR_PATHCONV_N] > 0) {
+      eng.pathconv_sum += c[GPU_CTR_PATHCONV_ACC] / 100.0;
+      eng.pathfull_sum += c[GPU_CTR_PATHFULL_ACC] / 100.0;
+      c[GPU_CTR_PATHFULL_ACC] = 0;
+      eng.pathconv_n += c[GPU_CTR_PATHCONV_N];
+      c[GPU_CTR_PATHCONV_ACC] = 0;
+      c[GPU_CTR_PATHCONV_N] = 0;
     }
   }
 
@@ -1580,11 +1591,13 @@ void finalize()
       write_message(
         fmt::format("GPU transport device time: {:.3f} s ({:.4g} events, "
                     "{:.2f} ns/event, {:.2f} xs evals/event, "
-                    "SIMD eff {:.1f}%)",
+                    "SIMD eff {:.1f}%, path agree {:.1f}%, fully converged {:.1f}%)",
           eng.gpu_seconds, eng.total_events,
           eng.total_events > 0 ? eng.gpu_seconds / eng.total_events * 1e9 : 0.0,
           eng.total_events > 0 ? eng.total_xseval / eng.total_events : 0.0,
-          eng.simdeff_n > 0 ? 100.0 * eng.simdeff_sum / eng.simdeff_n : 0.0),
+          eng.simdeff_n > 0 ? 100.0 * eng.simdeff_sum / eng.simdeff_n : 0.0,
+          eng.pathconv_n > 0 ? 100.0 * eng.pathconv_sum / eng.pathconv_n : 0.0,
+          eng.pathconv_n > 0 ? 100.0 * eng.pathfull_sum / eng.pathconv_n : 0.0),
         6);
     }
     omg_metal_destroy(eng.ctx);

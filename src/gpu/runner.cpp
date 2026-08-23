@@ -257,6 +257,8 @@ struct Engine {
   uint64_t spill_uid_cursor = 0; // monotonic spill-id allocator
   double total_events = 0.0;     // summed device events (perf diagnostics)
   double total_xseval = 0.0;     // summed cross-section evaluations
+  double simdeff_sum = 0.0;      // summed per-thread SIMD-group efficiency
+  double simdeff_n = 0.0;
 };
 
 Engine eng;
@@ -1201,6 +1203,8 @@ void transport_generation()
     global_tally_leakage += sums[GPU_RED_LEAKAGE];
     eng.total_events += sums[GPU_RED_EVENTS];
     eng.total_xseval += sums[GPU_RED_XSEVAL];
+    eng.simdeff_sum += sums[GPU_RED_SIMDEFF];
+    eng.simdeff_n += (double)n_slots;
   };
 
   // ---- dispatch in chunks, with interactivity-watchdog recovery ----
@@ -1554,10 +1558,12 @@ void finalize()
     if (eng.active) {
       write_message(
         fmt::format("GPU transport device time: {:.3f} s ({:.4g} events, "
-                    "{:.2f} ns/event, {:.2f} xs evals/event)",
+                    "{:.2f} ns/event, {:.2f} xs evals/event, "
+                    "SIMD eff {:.1f}%)",
           eng.gpu_seconds, eng.total_events,
           eng.total_events > 0 ? eng.gpu_seconds / eng.total_events * 1e9 : 0.0,
-          eng.total_events > 0 ? eng.total_xseval / eng.total_events : 0.0),
+          eng.total_events > 0 ? eng.total_xseval / eng.total_events : 0.0,
+          eng.simdeff_n > 0 ? 100.0 * eng.simdeff_sum / eng.simdeff_n : 0.0),
         6);
     }
     omg_metal_destroy(eng.ctx);

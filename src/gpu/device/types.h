@@ -254,7 +254,12 @@ struct GpuTallyDesc {
 // almost never hits, because energy changes at every collision and material
 // at every crossing.
 #define GPU_RED_XSEVAL 5
-#define GPU_RED_WIDTH 6
+// SIMD-group efficiency for the history loop: sum(events) / (width *
+// max(events)) across the group. This is the fraction of lane-slots doing
+// real work while the group's longest history runs; everything else is
+// masked off. Bounds what staging the kernel by operation type could win.
+#define GPU_RED_SIMDEFF 6
+#define GPU_RED_WIDTH 7
 
 struct GpuControl {
   uint32_gpu n_particles;   // particles this dispatch

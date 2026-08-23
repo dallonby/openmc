@@ -84,6 +84,15 @@ kernel void openmc_transport(constant GpuControl& ctl [[buffer(0)]],
   banks.trace = trace_buf;
 
   gpu_run_particle(tid, ctl, geom, mg, ce, sab, tv, banks);
+
+  // History-length divergence: the group runs until its longest history
+  // finishes, so lanes that ended early are masked from there on.
+  float ev = red_slots[tid * GPU_RED_WIDTH + GPU_RED_EVENTS];
+  float mx = simd_max(ev);
+  float sm = simd_sum(ev);
+  float width = (float)simd_sum(1.0f);
+  red_slots[tid * GPU_RED_WIDTH + GPU_RED_SIMDEFF] =
+    (mx > 0.0f && width > 0.0f) ? sm / (width * mx) : 0.0f;
 }
 
 // Math-function probe: y = f(x) for the host to compare against libm
